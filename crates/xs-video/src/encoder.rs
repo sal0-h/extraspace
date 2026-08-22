@@ -124,13 +124,7 @@ impl Encoder {
 /// only every ten seconds while idle, which is exactly when a tablet is most
 /// likely to attach and need one.
 fn keyframe_interval_frames(nominal_framerate: u32) -> u32 {
-    /// Rate to assume when the screen is mostly static, measured on real hardware.
-    const IDLE_FPS: u32 = 12;
-    const TARGET_SECONDS: u32 = 2;
-    nominal_framerate
-        .min(IDLE_FPS)
-        .saturating_mul(TARGET_SECONDS)
-        .max(2)
+    nominal_framerate.saturating_mul(2).max(2)
 }
 
 #[cfg(test)]

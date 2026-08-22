@@ -144,6 +144,8 @@ impl VideoPipeline {
             })?;
 
         let rate = make("videorate")?;
+        rate.set_property("drop-only", true);
+        rate.set_property("skip-to-first", true);
 
         let rate_caps = caps_filter(
             gst::Caps::builder("video/x-raw")
