@@ -85,6 +85,10 @@ impl Encoder {
                 // encoder buffers frames and adds tens of milliseconds.
                 .property_from_str("tune", "zerolatency")
                 .property_from_str("speed-preset", "veryfast")
+                // Sliced threads keep zerolatency's frame-in/frame-out; the
+                // default thread pool can add a scheduling hitch on U-series CPUs.
+                .property("sliced-threads", true)
+                .property("threads", 2u32)
                 // Annex-B, so the tablet can feed bytes straight to MediaCodec.
                 .property_from_str("byte-stream", "true")
                 // Keyframe interval is counted in *frames*, and an idle desktop
@@ -124,7 +128,13 @@ impl Encoder {
 /// only every ten seconds while idle, which is exactly when a tablet is most
 /// likely to attach and need one.
 fn keyframe_interval_frames(nominal_framerate: u32) -> u32 {
-    nominal_framerate.saturating_mul(2).max(2)
+    /// Rate to assume when the screen is mostly static, measured on real hardware.
+    const IDLE_FPS: u32 = 12;
+    const TARGET_SECONDS: u32 = 2;
+    nominal_framerate
+        .min(IDLE_FPS)
+        .saturating_mul(TARGET_SECONDS)
+        .max(2)
 }
 
 #[cfg(test)]

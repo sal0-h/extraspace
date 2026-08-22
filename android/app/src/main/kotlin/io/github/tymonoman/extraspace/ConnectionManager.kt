@@ -181,12 +181,14 @@ class ConnectionManager(
             // One reusable buffer: at 60fps, allocating per frame would keep the
             // GC busy for no reason.
             var buf = ByteArray(512 * 1024)
+            val recvPace = PaceWatch("recv")
 
             while (running.get()) {
                 val header = reader.readHeader()
                 if (header.length > buf.size) buf = ByteArray(header.length.coerceAtLeast(buf.size * 2))
                 reader.readPayload(header, buf)
                 val isConfig = (header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt()) != 0
+                recvPace.observe("bytes=${header.length} pts_us=${header.ptsUs}")
                 callbacks.onVideoFrame(buf, header.length, header.ptsUs, isConfig)
             }
         } catch (e: Exception) {

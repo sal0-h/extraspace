@@ -3,35 +3,48 @@
 //! The pipeline is deliberately boring:
 //!
 //! ```text
-//! pipewiresrc -> videorate -> videoconvert -> <encoder> -> h264parse -> appsink
+//! rust PipeWire capture + cursor overlay -> appsrc -> videorate(drop-only)
+//!            -> videoconvert -> I420 -> <encoder> -> h264parse -> appsink
 //! ```
 //!
-//! `videorate` caps the stream at the configured rate; it does **not** pad it up
-//! to that rate. Mutter only emits a frame when something on the monitor actually
-//! changes, so a still desktop measures around 11 fps rather than 60. That is
-//! correct and desirable -- an idle screen costs almost no bandwidth -- but it
-//! means frame-count-based reasoning is unreliable: see the keyframe note below.
+//! Capture is a single PipeWire consumer. A second client on the same mutter
+//! node (for example `pipewiresrc` plus a cursor listener) makes gst-plugin-pipewire
+//! abort on unfixed caps.
+//!
+//! `videorate` is configured **drop-only**: it caps the stream at the configured
+//! rate and must never manufacture frames. The default `videorate` duplicates
+//! the last buffer to fill holes, which on a damage-driven mutter capture
+//! (idle ~11 fps) builds seconds of fake "catch-up" latency. Mutter only emits
+//! a frame when something on the monitor actually changes; that is correct --
+//! an idle screen costs almost no bandwidth -- but it means frame-count-based
+//! reasoning is unreliable: see the keyframe note below.
 //!
 //! Encoded frames leave through a bounded channel. If the transport cannot keep
 //! up, frames are dropped here rather than allowed to accumulate -- for a live
 //! display, a stale frame has no value.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use gst::prelude::*;
 use gstreamer as gst;
-use gstreamer_app::AppSink;
+use gstreamer_app::{AppSink, AppSrc};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+mod cursor;
 mod encoder;
+mod pacing;
 pub use encoder::Encoder;
+pub use pacing::StagePace;
 
-/// Encoded frames buffered before we start dropping. Small on purpose: latency
-/// matters far more than completeness for a live display.
-const FRAME_QUEUE_DEPTH: usize = 4;
+/// `(frames, gaps, max_gap_us)` for one pipeline stage.
+pub type PaceWindow = (u64, u64, u64);
+
+/// Encoded frames buffered before we start dropping. One on purpose: a stale
+/// frame has no value, and a deeper queue is how a short stall becomes a hitch.
+const FRAME_QUEUE_DEPTH: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -49,6 +62,9 @@ pub enum Error {
 
     #[error("GStreamer pipeline error: {0}")]
     Pipeline(String),
+
+    #[error("PipeWire capture failed: {0}")]
+    Capture(String),
 
     #[error("failed to link the pipeline: {0}")]
     Link(#[from] gst::glib::BoolError),
@@ -89,6 +105,8 @@ pub struct VideoStats {
     pub frames_encoded: AtomicU64,
     pub frames_dropped: AtomicU64,
     pub bytes_encoded: AtomicU64,
+    pub last_au_bytes: AtomicU64,
+    pub last_keyframe_bytes: AtomicU64,
 }
 
 impl VideoStats {
@@ -108,6 +126,12 @@ pub struct VideoPipeline {
     encoder: Encoder,
     stats: Arc<VideoStats>,
     config: VideoConfig,
+    capture_pace: Arc<StagePace>,
+    rate_pace: Arc<StagePace>,
+    encode_pace: Arc<StagePace>,
+    node_id: u32,
+    hub: Arc<cursor::CursorHub>,
+    capture: Mutex<Option<cursor::Capture>>,
 }
 
 impl VideoPipeline {
@@ -118,6 +142,9 @@ impl VideoPipeline {
 
         let encoder = Encoder::detect().ok_or(Error::NoEncoder)?;
         let stats = Arc::new(VideoStats::default());
+        let capture_pace = Arc::new(StagePace::new("capture"));
+        let rate_pace = Arc::new(StagePace::new("videorate"));
+        let encode_pace = Arc::new(StagePace::new("encoded"));
         let pipeline = gst::Pipeline::with_name("extraspace-display");
 
         let make = |name: &'static str| -> Result<gst::Element> {
@@ -134,14 +161,21 @@ impl VideoPipeline {
                 })
         };
 
-        let src = gst::ElementFactory::make("pipewiresrc")
-            .property("path", node_id.to_string())
-            // Screen-cast buffers do not carry timestamps useful to us.
-            .property("do-timestamp", true)
-            .build()
-            .map_err(|_| Error::ElementMissing {
-                element: "pipewiresrc",
-            })?;
+        let overlay_caps = gst::Caps::builder("video/x-raw")
+            .field("format", "BGRx")
+            .field("width", config.width as i32)
+            .field("height", config.height as i32)
+            .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
+            .build();
+        let overlay_src = AppSrc::builder()
+            .name("cursor-overlay")
+            .format(gst::Format::Time)
+            .is_live(true)
+            .block(false)
+            .caps(&overlay_caps)
+            .build();
+        overlay_src.set_property("max-buffers", 1u64);
+        overlay_src.set_property_from_str("leaky-type", "downstream");
 
         let rate = make("videorate")?;
         rate.set_property("drop-only", true);
@@ -186,8 +220,8 @@ impl VideoPipeline {
             .sync(false)
             .build();
 
-        let elements = [
-            &src,
+        let encode_elements = [
+            overlay_src.upcast_ref(),
             &rate,
             &rate_caps,
             &convert,
@@ -197,11 +231,18 @@ impl VideoPipeline {
             &parse_caps,
             appsink.upcast_ref(),
         ];
-        pipeline.add_many(elements)?;
-        gst::Element::link_many(elements)?;
+        pipeline.add_many(encode_elements)?;
+        gst::Element::link_many(encode_elements)?;
+
+        let hub = cursor::CursorHub::new(config.framerate);
+        hub.attach_appsrc(overlay_src.clone());
+
+        pacing::attach_buffer_probe(overlay_src.upcast_ref(), "src", &capture_pace);
+        pacing::attach_buffer_probe(&rate, "src", &rate_pace);
 
         let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
         let sink_stats = Arc::clone(&stats);
+        let sink_pace = Arc::clone(&encode_pace);
 
         appsink.set_callbacks(
             gstreamer_app::AppSinkCallbacks::builder()
@@ -212,6 +253,7 @@ impl VideoPipeline {
 
                     let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
                     let pts_us = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+                    let au_bytes = map.len();
                     let frame = EncodedFrame {
                         data: Bytes::copy_from_slice(map.as_slice()),
                         pts_us,
@@ -220,7 +262,16 @@ impl VideoPipeline {
 
                     sink_stats
                         .bytes_encoded
-                        .fetch_add(map.len() as u64, Ordering::Relaxed);
+                        .fetch_add(au_bytes as u64, Ordering::Relaxed);
+                    sink_stats
+                        .last_au_bytes
+                        .store(au_bytes as u64, Ordering::Relaxed);
+                    if keyframe {
+                        sink_stats
+                            .last_keyframe_bytes
+                            .store(au_bytes as u64, Ordering::Relaxed);
+                    }
+                    sink_pace.observe(au_bytes, pts_us, keyframe.then_some("keyframe"));
                     match tx.try_send(frame) {
                         Ok(()) => {
                             sink_stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
@@ -256,6 +307,12 @@ impl VideoPipeline {
                 encoder,
                 stats,
                 config,
+                capture_pace,
+                rate_pace,
+                encode_pace,
+                node_id,
+                hub,
+                capture: Mutex::new(None),
             },
             rx,
         ))
@@ -266,10 +323,29 @@ impl VideoPipeline {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Pipeline(e.to_string()))?;
+        let mut capture = self.capture.lock().expect("capture lock");
+        if capture.is_none() {
+            match cursor::Capture::start(
+                self.node_id,
+                self.config.width,
+                self.config.height,
+                Arc::clone(&self.hub),
+            ) {
+                Ok(started) => *capture = Some(started),
+                Err(e) => {
+                    drop(capture);
+                    let _ = self.pipeline.set_state(gst::State::Null);
+                    return Err(Error::Capture(e));
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn stop(&self) {
+        if let Ok(mut capture) = self.capture.lock() {
+            *capture = None;
+        }
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             warn!(error = %e, "pipeline did not stop cleanly");
         }
@@ -297,6 +373,15 @@ impl VideoPipeline {
 
     pub fn stats(&self) -> &Arc<VideoStats> {
         &self.stats
+    }
+
+    /// `(capture, videorate, encoded)` window: each is `(frames, gaps, max_gap_us)`.
+    pub fn take_pacing(&self) -> (PaceWindow, PaceWindow, PaceWindow) {
+        (
+            self.capture_pace.take(),
+            self.rate_pace.take(),
+            self.encode_pace.take(),
+        )
     }
 
     pub fn encoder(&self) -> Encoder {

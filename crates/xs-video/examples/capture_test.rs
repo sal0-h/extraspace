@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         width: WIDTH,
         height: HEIGHT,
         refresh_rate: FRAMERATE as f64,
-        cursor_mode: CursorMode::Embedded,
+        cursor_mode: CursorMode::Metadata,
         source: CaptureSource::Virtual,
     })
     .await?;

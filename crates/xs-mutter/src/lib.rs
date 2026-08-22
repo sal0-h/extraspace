@@ -107,7 +107,7 @@ pub struct Session {
     screen_cast: ScreenCastSessionProxy<'static>,
     /// Object path of the stream, as a string -- the form the `Notify*` methods want.
     stream_path: String,
-    /// PipeWire node to consume with `pipewiresrc path=<node_id>`.
+    /// PipeWire node id of the screen-cast stream.
     node_id: u32,
     config: DisplayConfig,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
@@ -221,7 +221,7 @@ impl Session {
         })
     }
 
-    /// PipeWire node id to feed to `pipewiresrc path=...`.
+    /// PipeWire node id of the screen-cast stream.
     pub fn node_id(&self) -> u32 {
         self.node_id
     }

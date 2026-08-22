@@ -58,6 +58,9 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
 
         // A second monitor that sleeps is not a second monitor.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.setPreferMinimalPostProcessing(true)
+        }
         goFullscreen()
 
         setContentView(R.layout.activity_mirror)

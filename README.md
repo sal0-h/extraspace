@@ -247,7 +247,7 @@ XML and took some experimentation to get right:
 From there it is a normal GStreamer pipeline:
 
 ```
-pipewiresrc → videorate → videoconvert → x264enc → h264parse → appsink → USB
+PipeWire capture + cursor overlay → appsrc → videorate (drop-only) → videoconvert → x264enc → h264parse → appsink → USB
 ```
 
 and on the tablet, `MediaCodec` → `SurfaceView`. Touches travel back on a separate
@@ -282,6 +282,15 @@ Things that cost time, recorded so they cost you less:
   down the entire unix socket to the device when either direction closes. Splitting
   a read-only stream and dropping the unused write half is therefore fatal — the
   peer's next write gets EPIPE. Streams used one way are not split at all here.
+- **Mutter's embedded cursor only updates when the desktop is damaged.** Pointer
+  motion is a hardware plane, not damage, so a still window freezes the cursor.
+  Metadata mode plus a single PipeWire consumer that blits `SPA_META_Cursor` is
+  the fix. A second consumer (`pipewiresrc` plus a listener) makes
+  gst-plugin-pipewire abort on unfixed caps. A fullscreen GTK "damage pump"
+  becomes an opaque black window on Meta-0.
+- **Default `videorate` invents frames.** On a damage-driven capture (idle ~11
+  fps) it duplicates the last buffer to fill 60 fps holes and builds seconds of
+  fake catch-up latency. The pipeline is drop-only.
 - **Draining MediaCodec only when input arrives loses the last frame.** Because
   mutter sends only on damage, an idle desktop delivers nothing for seconds at a
   time; if output is drained inside the input path, the final frame stays decoded

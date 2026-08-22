@@ -296,7 +296,10 @@ async fn connect(
             width,
             height,
             refresh_rate: config.framerate as f64,
-            cursor_mode: CursorMode::Embedded,
+            // Metadata, not Embedded: mutter only paints an embedded cursor
+            // when the virtual monitor is damaged, so a still window freezes
+            // the pointer. xs-video composites SPA_META_Cursor itself.
+            cursor_mode: CursorMode::Metadata,
             source,
         })
         .await?,
@@ -358,19 +361,29 @@ async fn connect(
     let mut tasks = Vec::new();
 
     // --- video out -------------------------------------------------------
-    let mut video_writer = FrameWriter::new(video);
-    tasks.push(tokio::spawn(async move {
-        while let Some(frame) = frames.recv().await {
-            let flag = if frame.keyframe { flags::KEYFRAME } else { 0 };
-            if let Err(e) = video_writer
-                .write_frame(Channel::VideoDown, 0, flag, frame.pts_us, &frame.data)
-                .await
-            {
-                debug!(error = %e, "video channel closed");
-                break;
+    let write_pace = Arc::new(WritePace::default());
+    {
+        let write_pace = Arc::clone(&write_pace);
+        let mut video_writer = FrameWriter::new(video);
+        tasks.push(tokio::spawn(async move {
+            let mut last_start = Instant::now();
+            while let Some(frame) = frames.recv().await {
+                let inter = last_start.elapsed();
+                last_start = Instant::now();
+                let flag = if frame.keyframe { flags::KEYFRAME } else { 0 };
+                let bytes = frame.data.len();
+                if let Err(e) = video_writer
+                    .write_frame(Channel::VideoDown, 0, flag, frame.pts_us, &frame.data)
+                    .await
+                {
+                    debug!(error = %e, "video channel closed");
+                    break;
+                }
+                let write = last_start.elapsed();
+                write_pace.observe(inter, write, bytes, frame.keyframe, frame.pts_us);
             }
-        }
-    }));
+        }));
+    }
 
     // --- ping: measure real round-trip latency ---------------------------
     {
@@ -397,6 +410,8 @@ async fn connect(
         let events = events.clone();
         let mutter = Arc::clone(&mutter);
         let stats_source = Arc::clone(pipeline.stats());
+        let pipeline_pace = Arc::clone(&pipeline);
+        let write_pace = Arc::clone(&write_pace);
         let controller = Arc::clone(&controller);
         let rtt_us = Arc::clone(&rtt_us);
         let bitrate_tx = bitrate_tx.clone();
@@ -480,6 +495,8 @@ async fn connect(
                         // Log the inputs, not just the decision: when the bitrate
                         // walks somewhere surprising, the only useful question is
                         // which of the three signals drove it.
+                        let (capture, videorate, encoded_pace) = pipeline_pace.take_pacing();
+                        let write = write_pace.take();
                         debug!(
                             queue = sample.decode_queue_depth,
                             drops = sample.dropped_delta,
@@ -487,6 +504,15 @@ async fn connect(
                             host_dropped = dropped,
                             device_dropped = device.frames_dropped,
                             encoded,
+                            capture_max_ms = capture.2 / 1000,
+                            rate_max_ms = videorate.2 / 1000,
+                            encode_max_ms = encoded_pace.2 / 1000,
+                            write_max_ms = write.max_write_us / 1000,
+                            write_inter_max_ms = write.max_inter_us / 1000,
+                            au_bytes = stats_source.last_au_bytes.load(Ordering::Relaxed),
+                            keyframe_bytes =
+                                stats_source.last_keyframe_bytes.load(Ordering::Relaxed),
+                            device_pts_us = device.last_frame_pts_us,
                             "health sample"
                         );
 
@@ -579,6 +605,53 @@ async fn connect(
         width,
         height,
     })
+}
+
+#[derive(Default)]
+struct WritePace {
+    max_write_us: AtomicU64,
+    max_inter_us: AtomicU64,
+}
+
+struct WriteWindow {
+    max_write_us: u64,
+    max_inter_us: u64,
+}
+
+impl WritePace {
+    fn observe(&self, inter: Duration, write: Duration, bytes: usize, keyframe: bool, pts_us: u64) {
+        let write_us = write.as_micros() as u64;
+        let inter_us = inter.as_micros() as u64;
+        fetch_max(&self.max_write_us, write_us);
+        fetch_max(&self.max_inter_us, inter_us);
+        if write >= Duration::from_millis(20) || inter >= Duration::from_millis(50) {
+            warn!(
+                write_ms = write.as_millis() as u64,
+                inter_ms = inter.as_millis() as u64,
+                bytes,
+                keyframe,
+                pts_us,
+                "video write pacing gap"
+            );
+        }
+    }
+
+    fn take(&self) -> WriteWindow {
+        WriteWindow {
+            max_write_us: self.max_write_us.swap(0, Ordering::Relaxed),
+            max_inter_us: self.max_inter_us.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+fn fetch_max(slot: &AtomicU64, value: u64) {
+    let mut current = slot.load(Ordering::Relaxed);
+    while value > current {
+        match slot.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(seen) => current = seen,
+        }
+    }
 }
 
 /// Reads frames until the tablet's `Hello` turns up.

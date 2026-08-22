@@ -34,6 +34,8 @@ class VideoDecoder(private val surface: Surface) {
 
     /** Frames submitted but not yet released for display. Touched by two threads. */
     private val pendingInputs = AtomicInteger(0)
+    private val inputPace = PaceWatch("decode_in")
+    private val outputPace = PaceWatch("decode_out")
 
     fun start(width: Int, height: Int, csd: ByteArray?) {
         stop()
@@ -46,6 +48,9 @@ class VideoDecoder(private val surface: Surface) {
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1)
             }
             // SPS/PPS, if the host sent them ahead of the first frame. The host
             // also repeats them inline on every keyframe, so this is belt and
@@ -76,19 +81,24 @@ class VideoDecoder(private val surface: Surface) {
             // Short timeout rather than blocking: if the codec is saturated we
             // would rather drop this frame than stall the socket reader and let
             // even more frames pile up behind it.
+            val waitStart = System.nanoTime()
             val index = mc.dequeueInputBuffer(INPUT_TIMEOUT_US)
             if (index < 0) {
                 framesDropped.incrementAndGet()
                 return false
             }
+            val waitMs = (System.nanoTime() - waitStart) / 1_000_000L
             mc.getInputBuffer(index)?.apply {
                 clear()
                 put(data, 0, length)
             }
             val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
-            mc.queueInputBuffer(index, 0, length, ptsUs, flags)
+            // Do not pass the host GStreamer PTS through: it is a different
+            // clock and Samsung MediaCodec will pace to it. 0 = "show now".
+            mc.queueInputBuffer(index, 0, length, 0, flags)
             pendingInputs.incrementAndGet()
             lastFramePtsUs.set(ptsUs)
+            inputPace.observe("bytes=$length pts_us=$ptsUs wait_ms=$waitMs")
             true
         } catch (e: IllegalStateException) {
             Log.e(TAG, "decoder rejected input", e)
@@ -109,11 +119,13 @@ class VideoDecoder(private val surface: Surface) {
             try {
                 when (val index = mc.dequeueOutputBuffer(info, DRAIN_TIMEOUT_US)) {
                     in 0..Int.MAX_VALUE -> {
-                        // true = render this frame to the surface now.
-                        mc.releaseOutputBuffer(index, true)
+                        // 0 ns = present immediately; the boolean overload lets
+                        // SurfaceFlinger keep the (zero/host) PTS and hitch.
+                        mc.releaseOutputBuffer(index, 0L)
                         pendingInputs.updateAndGet { (it - 1).coerceAtLeast(0) }
                         framesDecoded.incrementAndGet()
                         renderedAtUs.set(System.nanoTime() / 1000)
+                        outputPace.observe("pts_us=${info.presentationTimeUs} size=${info.size}")
                     }
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
                         Log.i(TAG, "output format now ${mc.outputFormat}")
