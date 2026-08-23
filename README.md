@@ -250,7 +250,7 @@ From there it is a normal GStreamer pipeline:
 PipeWire capture + cursor overlay → appsrc → videorate (drop-only) → videoconvert → x264enc → h264parse → appsink → USB
 ```
 
-and on the tablet, `MediaCodec` → `SurfaceView`. Touches travel back on a separate
+and on the tablet, `MediaCodec` → `TextureView`. Touches travel back on a separate
 socket and become `NotifyTouchDown/Motion/Up` calls, whose coordinates are already
 in the virtual monitor's space.
 

@@ -4,20 +4,23 @@
     android:layout_height="match_parent"
     android:background="@android:color/black">
 
-    <SurfaceView
+    <!-- TextureView, not SurfaceView: MediaCodec on a SurfaceView is its own
+         compositor plane and sits above every in-window overlay on Samsung. -->
+    <TextureView
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
     <ImageView
         android:id="@+id/cursor"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:layout_gravity="top|start"
         android:clickable="false"
         android:focusable="false"
         android:importantForAccessibility="no"
-        android:elevation="8dp"
-        android:visibility="invisible" />
+        android:scaleType="fitXY"
+        android:visibility="gone" />
 
     <TextView
         android:id="@+id/status"
