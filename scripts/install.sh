@@ -105,26 +105,10 @@ StartupWMClass=$BIN_NAME
 EOF
 ok "installed desktop entry"
 
-# --- autostart ---------------------------------------------------------------
-# auto_connect is on in the frozen config, so a login is enough: plug the
-# tablet in and Extra Display starts without hunting for a terminal.
-AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
-mkdir -p "$AUTOSTART_DIR"
-cat > "$AUTOSTART_DIR/$APP_ID.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Extraspace
-GenericName=Tablet Display
-Comment=Use an Android tablet as an extra display and webcam
-Exec=$BIN_DIR/$BIN_NAME
-Icon=$APP_ID
-Terminal=false
-Categories=Utility;GTK;GNOME;
-StartupNotify=true
-StartupWMClass=$BIN_NAME
-X-GNOME-Autostart-enabled=true
-EOF
-ok "installed autostart (disable in GNOME Tweaks / Startup Applications if you do not want it at login)"
+# Do not autostart. ExtraSpace is a normal windowed app; start it from the
+# grid or with `extraspace` when you want it. Clear a leftover login entry
+# from older installs so it does not come back.
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop"
 
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -f -t "$DATA_DIR/icons/hicolor" 2>/dev/null || true
@@ -141,4 +125,4 @@ esac
 echo
 bold "Done."
 echo "Find \"Extraspace\" in your applications, or run: $BIN_NAME"
-echo "It also starts at login. Remove it again with: ./scripts/install.sh --uninstall"
+echo "Remove it again with: ./scripts/install.sh --uninstall"
