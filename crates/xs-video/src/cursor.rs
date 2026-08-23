@@ -1,12 +1,16 @@
-//! Capture mutter's PipeWire screen-cast and overlay the cursor.
+//! Capture mutter's PipeWire screen-cast and split out the cursor.
 //!
 //! Embedded cursor mode only paints the pointer when the virtual monitor is
 //! damaged, so a still window (or empty wallpaper) freezes it. Metadata mode
 //! sends the sprite out-of-band, including on cursor-only buffers (`chunk` size
 //! 0). `pipewiresrc` drops those, and a second consumer on the same node makes
 //! it abort (`handle_format_change` with unfixed caps). This crate is therefore
-//! the only PipeWire client: one stream reads frames and `SPA_META_Cursor`,
-//! blits the sprite, and pushes BGRx into the encoder `appsrc`.
+//! the only PipeWire client: one stream reads frames and `SPA_META_Cursor`.
+//!
+//! Video damage is pushed into the encoder `appsrc`. Cursor motion is *not*
+//! republished as a video frame -- it goes out on the control channel so the
+//! tablet can composite an overlay. A cursor-only buffer therefore costs a
+//! sprite/position message, not a convert+encode+USB cycle.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +20,9 @@ use std::time::Instant;
 use gstreamer as gst;
 use gstreamer_app::AppSrc;
 use pipewire::{self as pw, properties::properties, spa, sys as pw_sys};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use xs_proto::{CursorBitmap, CursorMessage};
 
 const CURSOR_META_MAX: u32 = 384;
 
@@ -29,22 +35,34 @@ struct Sprite {
     hot_y: i32,
     width: u32,
     height: u32,
-    stride: usize,
-    /// Packed BGRA, stride bytes per row.
+    /// Packed BGRA, `width * 4` bytes per row.
     pixels: Vec<u8>,
 }
 
-#[derive(Clone)]
-struct LastFrame {
+struct VideoFrame {
     width: u32,
     height: u32,
     /// Packed BGRx, `width * 4` bytes per row.
     pixels: Vec<u8>,
 }
 
+#[derive(Default)]
+struct PendingCursor {
+    visible: bool,
+    x: i32,
+    y: i32,
+    hot_x: i32,
+    hot_y: i32,
+    bitmap: Option<(u16, u16, Vec<u8>)>,
+    pos_changed: bool,
+    shape_changed: bool,
+    vis_changed: bool,
+}
+
 pub struct CursorHub {
     sprite: Mutex<Sprite>,
-    last: Mutex<Option<LastFrame>>,
+    pending: Mutex<PendingCursor>,
+    cursor_tx: mpsc::Sender<()>,
     appsrc: Mutex<Option<AppSrc>>,
     origin: Instant,
     framerate: u32,
@@ -65,10 +83,11 @@ struct CaptureData {
 }
 
 impl CursorHub {
-    pub fn new(framerate: u32) -> Arc<Self> {
+    pub fn new(framerate: u32, cursor_tx: mpsc::Sender<()>) -> Arc<Self> {
         Arc::new(Self {
             sprite: Mutex::new(Sprite::default()),
-            last: Mutex::new(None),
+            pending: Mutex::new(PendingCursor::default()),
+            cursor_tx,
             appsrc: Mutex::new(None),
             origin: Instant::now(),
             framerate: framerate.max(1),
@@ -81,50 +100,165 @@ impl CursorHub {
         *self.appsrc.lock().expect("cursor appsrc lock") = Some(appsrc);
     }
 
+    pub fn take_cursor_message(&self) -> Option<CursorMessage> {
+        let mut pending = self.pending.lock().expect("cursor pending lock");
+        if !pending.pos_changed && !pending.shape_changed && !pending.vis_changed {
+            return None;
+        }
+        let bitmap = if pending.shape_changed {
+            pending
+                .bitmap
+                .take()
+                .map(|(width, height, pixels)| CursorBitmap {
+                    width,
+                    height,
+                    pixels,
+                })
+        } else {
+            None
+        };
+        let hotspot = if pending.shape_changed {
+            Some((pending.hot_x as i16, pending.hot_y as i16))
+        } else {
+            None
+        };
+        let position = if pending.pos_changed || pending.shape_changed {
+            Some((pending.x, pending.y))
+        } else {
+            None
+        };
+        let msg = if pending.visible {
+            CursorMessage {
+                visible: true,
+                position,
+                hotspot,
+                bitmap,
+            }
+        } else {
+            CursorMessage::hide()
+        };
+        pending.pos_changed = false;
+        pending.shape_changed = false;
+        pending.vis_changed = false;
+        Some(msg)
+    }
+
     fn store_cursor(&self, update: CursorUpdate) {
         let mut sprite = self.sprite.lock().expect("cursor sprite lock");
-        match update {
+        let emit = match update {
             CursorUpdate::Hidden => {
                 if !sprite.visible && sprite.pixels.is_empty() {
-                    return;
+                    None
+                } else {
+                    sprite.visible = false;
+                    Some(CursorEmit::Hide)
                 }
-                sprite.visible = false;
             }
             CursorUpdate::Move { x, y } => {
                 if sprite.x == x && sprite.y == y && sprite.visible {
-                    return;
+                    None
+                } else {
+                    sprite.x = x;
+                    sprite.y = y;
+                    sprite.visible = !sprite.pixels.is_empty();
+                    if sprite.visible {
+                        Some(CursorEmit::Move { x, y })
+                    } else {
+                        Some(CursorEmit::Hide)
+                    }
                 }
-                sprite.x = x;
-                sprite.y = y;
-                sprite.visible = !sprite.pixels.is_empty();
             }
             CursorUpdate::Bitmap(next) => {
-                *sprite = next;
+                let same_shape = sprite.width == next.width
+                    && sprite.height == next.height
+                    && sprite.hot_x == next.hot_x
+                    && sprite.hot_y == next.hot_y
+                    && sprite.pixels == next.pixels;
+                if same_shape {
+                    if sprite.x == next.x && sprite.y == next.y && sprite.visible {
+                        None
+                    } else {
+                        sprite.x = next.x;
+                        sprite.y = next.y;
+                        sprite.visible = true;
+                        Some(CursorEmit::Move {
+                            x: next.x,
+                            y: next.y,
+                        })
+                    }
+                } else {
+                    *sprite = next;
+                    Some(CursorEmit::Shape)
+                }
             }
-        }
+        };
+        let snapshot = match &emit {
+            Some(CursorEmit::Shape) => Some(sprite.clone()),
+            _ => None,
+        };
         drop(sprite);
+        let Some(emit) = emit else {
+            return;
+        };
         if !self.seen_cursor.swap(true, Ordering::Relaxed) {
             info!("cursor metadata is arriving from mutter");
         }
+        match emit {
+            CursorEmit::Hide => self.queue_hide(),
+            CursorEmit::Move { x, y } => self.queue_move(x, y),
+            CursorEmit::Shape => {
+                if let Some(sprite) = snapshot {
+                    self.queue_shape(&sprite);
+                }
+            }
+        }
     }
 
-    fn on_video_frame(&self, last: LastFrame) {
+    fn queue_hide(&self) {
+        let mut pending = self.pending.lock().expect("cursor pending lock");
+        pending.visible = false;
+        pending.vis_changed = true;
+        drop(pending);
+        let _ = self.cursor_tx.try_send(());
+    }
+
+    fn queue_move(&self, x: i32, y: i32) {
+        let mut pending = self.pending.lock().expect("cursor pending lock");
+        pending.visible = true;
+        pending.x = x;
+        pending.y = y;
+        pending.pos_changed = true;
+        drop(pending);
+        let _ = self.cursor_tx.try_send(());
+    }
+
+    fn queue_shape(&self, sprite: &Sprite) {
+        let mut pending = self.pending.lock().expect("cursor pending lock");
+        pending.visible = sprite.visible;
+        pending.x = sprite.x;
+        pending.y = sprite.y;
+        pending.hot_x = sprite.hot_x;
+        pending.hot_y = sprite.hot_y;
+        let width = sprite.width.min(u16::MAX as u32) as u16;
+        let height = sprite.height.min(u16::MAX as u32) as u16;
+        pending.bitmap = Some((width, height, sprite.pixels.clone()));
+        pending.pos_changed = true;
+        pending.shape_changed = true;
+        pending.vis_changed = true;
+        drop(pending);
+        let _ = self.cursor_tx.try_send(());
+    }
+
+    fn on_video_frame(&self, frame: VideoFrame) {
         if !self.seen_video.swap(true, Ordering::Relaxed) {
             info!(
-                width = last.width,
-                height = last.height,
+                width = frame.width,
+                height = frame.height,
                 "screen-cast frame arrived"
             );
-            self.set_appsrc_caps(last.width, last.height);
+            self.set_appsrc_caps(frame.width, frame.height);
         }
-        *self.last.lock().expect("cursor last-frame lock") = Some(last.clone());
-        self.push_composed(&last);
-    }
-
-    fn republish_last(&self) {
-        if let Some(last) = self.last.lock().expect("cursor last-frame lock").clone() {
-            self.push_composed(&last);
-        }
+        self.push_frame(frame);
     }
 
     fn set_appsrc_caps(&self, width: u32, height: u32) {
@@ -140,31 +274,20 @@ impl CursorHub {
         appsrc.set_caps(Some(&caps));
     }
 
-    fn push_composed(&self, last: &LastFrame) {
+    fn push_frame(&self, frame: VideoFrame) {
         let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() else {
             return;
         };
-        let sprite = self.sprite.lock().expect("cursor sprite lock").clone();
-        let mut pixels = last.pixels.clone();
-        if sprite.visible {
-            blit_bgra(
-                &mut pixels,
-                (last.width * 4) as usize,
-                last.width,
-                last.height,
-                &sprite,
-            );
-        }
-        let mut buffer = gst::Buffer::from_mut_slice(pixels);
+        let mut buffer = gst::Buffer::from_mut_slice(frame.pixels);
         {
-            let buffer = buffer.get_mut().expect("new overlay buffer is writable");
+            let buffer = buffer.get_mut().expect("new capture buffer is writable");
             buffer.set_pts(self.now_pts());
             buffer.set_duration(gst::ClockTime::from_nseconds(
                 1_000_000_000 / u64::from(self.framerate),
             ));
         }
         if let Err(err) = appsrc.push_buffer(buffer) {
-            debug!(error = %err, "cursor overlay push dropped");
+            debug!(error = %err, "capture push dropped");
         }
     }
 
@@ -177,6 +300,12 @@ enum CursorUpdate {
     Hidden,
     Move { x: i32, y: i32 },
     Bitmap(Sprite),
+}
+
+enum CursorEmit {
+    Hide,
+    Move { x: i32, y: i32 },
+    Shape,
 }
 
 impl Capture {
@@ -307,14 +436,11 @@ fn run_capture_stream(
             }
             let cursor = unsafe { parse_cursor(raw) };
             let video = unsafe { copy_video_frame(raw, data) };
-            let had_cursor = cursor.is_some();
             if let Some(update) = cursor {
                 data.hub.store_cursor(update);
             }
             if let Some(frame) = video {
                 data.hub.on_video_frame(frame);
-            } else if had_cursor {
-                data.hub.republish_last();
             }
             unsafe { stream.queue_raw_buffer(raw) };
         })
@@ -520,7 +646,6 @@ unsafe fn parse_cursor(pw_buf: *mut pw_sys::pw_buffer) -> Option<CursorUpdate> {
             hot_y: cursor.hot_y,
             width: bitmap.width,
             height: bitmap.height,
-            stride: (bitmap.width * 4) as usize,
             pixels,
         }));
     }
@@ -530,7 +655,7 @@ unsafe fn parse_cursor(pw_buf: *mut pw_sys::pw_buffer) -> Option<CursorUpdate> {
 unsafe fn copy_video_frame(
     pw_buf: *mut pw_sys::pw_buffer,
     data: &mut CaptureData,
-) -> Option<LastFrame> {
+) -> Option<VideoFrame> {
     let spa_buf = (*pw_buf).buffer;
     if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
         return None;
@@ -575,7 +700,7 @@ unsafe fn copy_video_frame(
         (width * 4) as usize
     };
     match pack_video(pixels, stride, width, height, data.format.format()) {
-        Some(packed) => Some(LastFrame {
+        Some(packed) => Some(VideoFrame {
             width,
             height,
             pixels: packed,
@@ -685,86 +810,52 @@ fn argb_to_bgrx(src: &[u8], dest: &mut [u8]) {
     }
 }
 
-fn blit_bgra(frame: &mut [u8], stride: usize, width: u32, height: u32, sprite: &Sprite) {
-    let dest_x = sprite.x - sprite.hot_x;
-    let dest_y = sprite.y - sprite.hot_y;
-    let fw = width as i32;
-    let fh = height as i32;
-    for row in 0..sprite.height as i32 {
-        let dy = dest_y + row;
-        if dy < 0 || dy >= fh {
-            continue;
-        }
-        for col in 0..sprite.width as i32 {
-            let dx = dest_x + col;
-            if dx < 0 || dx >= fw {
-                continue;
-            }
-            let si = row as usize * sprite.stride + col as usize * 4;
-            if si + 3 >= sprite.pixels.len() {
-                continue;
-            }
-            let src = &sprite.pixels[si..si + 4];
-            let a = src[3] as u32;
-            if a == 0 {
-                continue;
-            }
-            let di = dy as usize * stride + dx as usize * 4;
-            if di + 2 >= frame.len() {
-                continue;
-            }
-            if a == 255 {
-                frame[di] = src[0];
-                frame[di + 1] = src[1];
-                frame[di + 2] = src[2];
-            } else {
-                let ia = 255 - a;
-                frame[di] = ((src[0] as u32 * a + frame[di] as u32 * ia) / 255) as u8;
-                frame[di + 1] = ((src[1] as u32 * a + frame[di + 1] as u32 * ia) / 255) as u8;
-                frame[di + 2] = ((src[2] as u32 * a + frame[di + 2] as u32 * ia) / 255) as u8;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn opaque_cursor_pixel_overwrites_the_frame() {
-        let mut frame = vec![0u8; 4];
-        let sprite = Sprite {
+    fn test_hub() -> (Arc<CursorHub>, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel(1);
+        (CursorHub::new(60, tx), rx)
+    }
+
+    fn sample_sprite(x: i32, y: i32, pixel: u8) -> Sprite {
+        Sprite {
             visible: true,
-            x: 0,
-            y: 0,
-            hot_x: 0,
-            hot_y: 0,
+            x,
+            y,
+            hot_x: 1,
+            hot_y: 2,
             width: 1,
             height: 1,
-            stride: 4,
-            pixels: vec![10, 20, 30, 255],
-        };
-        blit_bgra(&mut frame, 4, 1, 1, &sprite);
-        assert_eq!(frame, vec![10, 20, 30, 0]);
+            pixels: vec![pixel, 0, 0, 255],
+        }
     }
 
     #[test]
-    fn hidden_alpha_is_ignored() {
-        let mut frame = vec![9, 8, 7, 0];
-        let sprite = Sprite {
-            visible: true,
-            x: 0,
-            y: 0,
-            hot_x: 0,
-            hot_y: 0,
-            width: 1,
-            height: 1,
-            stride: 4,
-            pixels: vec![1, 2, 3, 0],
-        };
-        blit_bgra(&mut frame, 4, 1, 1, &sprite);
-        assert_eq!(frame, vec![9, 8, 7, 0]);
+    fn latest_cursor_position_wins() {
+        let (hub, mut rx) = test_hub();
+        hub.store_cursor(CursorUpdate::Bitmap(sample_sprite(10, 20, 9)));
+        hub.store_cursor(CursorUpdate::Move { x: 11, y: 21 });
+        hub.store_cursor(CursorUpdate::Move { x: 30, y: 40 });
+        let msg = hub.take_cursor_message().unwrap();
+        assert!(msg.visible);
+        assert_eq!(msg.position, Some((30, 40)));
+        assert!(msg.bitmap.is_some());
+        assert!(rx.try_recv().is_ok());
+        assert!(hub.take_cursor_message().is_none());
+    }
+
+    #[test]
+    fn unchanged_sprite_is_position_only() {
+        let (hub, _) = test_hub();
+        hub.store_cursor(CursorUpdate::Bitmap(sample_sprite(10, 20, 9)));
+        let _ = hub.take_cursor_message();
+        hub.store_cursor(CursorUpdate::Bitmap(sample_sprite(15, 25, 9)));
+        let msg = hub.take_cursor_message().unwrap();
+        assert_eq!(msg.position, Some((15, 25)));
+        assert!(msg.bitmap.is_none());
+        assert!(msg.hotspot.is_none());
     }
 
     #[test]

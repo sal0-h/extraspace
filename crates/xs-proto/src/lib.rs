@@ -68,8 +68,11 @@ pub mod flags {
     pub const CODEC_CONFIG: u16 = 1 << 1;
 }
 
-/// Message kinds on [`Channel::Control`]. Payload is JSON -- these are rare and
-/// small, and being able to read them in a log is worth more than the bytes saved.
+/// Message kinds on [`Channel::Control`].
+///
+/// Hello / VideoConfig / Stats / CameraControl / Error are JSON: they are rare
+/// and being able to read them in a log is worth more than the bytes saved.
+/// [`ControlKind::Cursor`] is binary -- it can arrive at the panel refresh rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ControlKind {
@@ -86,6 +89,8 @@ pub enum ControlKind {
     Pong = 5,
     /// Either direction: fatal error, connection is about to close.
     Error = 6,
+    /// Host -> device: cursor overlay. Binary; see [`CursorMessage`].
+    Cursor = 7,
 }
 
 impl ControlKind {
@@ -98,7 +103,155 @@ impl ControlKind {
             4 => Self::Ping,
             5 => Self::Pong,
             6 => Self::Error,
+            7 => Self::Cursor,
             _ => return None,
+        })
+    }
+}
+
+/// Flags for [`CursorMessage`].
+pub mod cursor_flags {
+    pub const VISIBLE: u8 = 1 << 0;
+    pub const POSITION: u8 = 1 << 1;
+    pub const HOTSPOT: u8 = 1 << 2;
+    pub const BITMAP: u8 = 1 << 3;
+}
+
+/// Packed BGRA cursor sprite, `width * 4` bytes per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorBitmap {
+    pub width: u16,
+    pub height: u16,
+    pub pixels: Vec<u8>,
+}
+
+/// Host -> device cursor overlay update.
+///
+/// ```text
+/// 0      flags  u8    cursor_flags
+/// [if POSITION] x i32  y i32     hotspot location in stream pixels
+/// [if HOTSPOT]  hx i16 hy i16    hotspot offset inside the sprite
+/// [if BITMAP]   w u16  h u16     then w*h*4 BGRA pixels
+/// ```
+///
+/// Position-only updates must not carry a bitmap. The tablet keeps the last
+/// sprite until a new one arrives or the cursor is hidden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorMessage {
+    pub visible: bool,
+    pub position: Option<(i32, i32)>,
+    pub hotspot: Option<(i16, i16)>,
+    pub bitmap: Option<CursorBitmap>,
+}
+
+impl CursorMessage {
+    pub fn hide() -> Self {
+        Self {
+            visible: false,
+            position: None,
+            hotspot: None,
+            bitmap: None,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut flags = 0u8;
+        if self.visible {
+            flags |= cursor_flags::VISIBLE;
+        }
+        if self.position.is_some() {
+            flags |= cursor_flags::POSITION;
+        }
+        if self.hotspot.is_some() {
+            flags |= cursor_flags::HOTSPOT;
+        }
+        if self.bitmap.is_some() {
+            flags |= cursor_flags::BITMAP;
+        }
+        let mut len = 1;
+        if self.position.is_some() {
+            len += 8;
+        }
+        if self.hotspot.is_some() {
+            len += 4;
+        }
+        if let Some(bitmap) = &self.bitmap {
+            len += 4 + bitmap.pixels.len();
+        }
+        let mut buf = Vec::with_capacity(len);
+        buf.push(flags);
+        if let Some((x, y)) = self.position {
+            buf.extend_from_slice(&x.to_le_bytes());
+            buf.extend_from_slice(&y.to_le_bytes());
+        }
+        if let Some((hx, hy)) = self.hotspot {
+            buf.extend_from_slice(&hx.to_le_bytes());
+            buf.extend_from_slice(&hy.to_le_bytes());
+        }
+        if let Some(bitmap) = &self.bitmap {
+            buf.extend_from_slice(&bitmap.width.to_le_bytes());
+            buf.extend_from_slice(&bitmap.height.to_le_bytes());
+            buf.extend_from_slice(&bitmap.pixels);
+        }
+        buf
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.is_empty() {
+            return None;
+        }
+        let flags = buf[0];
+        let mut i = 1;
+        let position = if flags & cursor_flags::POSITION != 0 {
+            if i + 8 > buf.len() {
+                return None;
+            }
+            let x = i32::from_le_bytes(buf[i..i + 4].try_into().ok()?);
+            let y = i32::from_le_bytes(buf[i + 4..i + 8].try_into().ok()?);
+            i += 8;
+            Some((x, y))
+        } else {
+            None
+        };
+        let hotspot = if flags & cursor_flags::HOTSPOT != 0 {
+            if i + 4 > buf.len() {
+                return None;
+            }
+            let hx = i16::from_le_bytes(buf[i..i + 2].try_into().ok()?);
+            let hy = i16::from_le_bytes(buf[i + 2..i + 4].try_into().ok()?);
+            i += 4;
+            Some((hx, hy))
+        } else {
+            None
+        };
+        let bitmap = if flags & cursor_flags::BITMAP != 0 {
+            if i + 4 > buf.len() {
+                return None;
+            }
+            let width = u16::from_le_bytes(buf[i..i + 2].try_into().ok()?);
+            let height = u16::from_le_bytes(buf[i + 2..i + 4].try_into().ok()?);
+            i += 4;
+            let pixels_len = (width as usize)
+                .checked_mul(height as usize)?
+                .checked_mul(4)?;
+            if i + pixels_len != buf.len() {
+                return None;
+            }
+            Some(CursorBitmap {
+                width,
+                height,
+                pixels: buf[i..].to_vec(),
+            })
+        } else if i != buf.len() {
+            return None;
+        } else {
+            None
+        };
+        Some(Self {
+            visible: flags & cursor_flags::VISIBLE != 0,
+            position,
+            hotspot,
+            bitmap,
         })
     }
 }
@@ -338,5 +491,41 @@ mod tests {
     #[test]
     fn magic_reads_as_xspa_on_the_wire() {
         assert_eq!(&MAGIC.to_le_bytes(), b"XSPA");
+    }
+
+    #[test]
+    fn cursor_hide_is_one_zero_byte() {
+        let msg = CursorMessage::hide();
+        let bytes = msg.encode();
+        assert_eq!(bytes, [0]);
+        assert_eq!(CursorMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn cursor_move_does_not_carry_a_bitmap() {
+        let msg = CursorMessage {
+            visible: true,
+            position: Some((1316, 10)),
+            hotspot: None,
+            bitmap: None,
+        };
+        let decoded = CursorMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(decoded.bitmap.is_none());
+    }
+
+    #[test]
+    fn cursor_sprite_roundtrips() {
+        let msg = CursorMessage {
+            visible: true,
+            position: Some((40, 50)),
+            hotspot: Some((3, 4)),
+            bitmap: Some(CursorBitmap {
+                width: 2,
+                height: 1,
+                pixels: vec![1, 2, 3, 255, 4, 5, 6, 128],
+            }),
+        };
+        assert_eq!(CursorMessage::decode(&msg.encode()).unwrap(), msg);
     }
 }

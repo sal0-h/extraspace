@@ -298,7 +298,7 @@ async fn connect(
             refresh_rate: config.framerate as f64,
             // Metadata, not Embedded: mutter only paints an embedded cursor
             // when the virtual monitor is damaged, so a still window freezes
-            // the pointer. xs-video composites SPA_META_Cursor itself.
+            // the pointer. Cursor sprite/position is forwarded to the tablet.
             cursor_mode: CursorMode::Metadata,
             source,
         })
@@ -307,7 +307,7 @@ async fn connect(
 
     step("Starting the video pipeline…");
     let start_kbps = starting_bitrate(width, height, config.framerate, config.bounds);
-    let (pipeline, mut frames) = VideoPipeline::new(
+    let (pipeline, mut frames, mut cursor_rx) = VideoPipeline::new(
         mutter.node_id(),
         PipelineConfig {
             width,
@@ -381,6 +381,29 @@ async fn connect(
                 }
                 let write = last_start.elapsed();
                 write_pace.observe(inter, write, bytes, frame.keyframe, frame.pts_us);
+            }
+        }));
+    }
+
+    // --- cursor out: overlay only, never a video frame -------------------
+    {
+        let writer = Arc::clone(&control_writer);
+        let pipeline = Arc::clone(&pipeline);
+        tasks.push(tokio::spawn(async move {
+            while cursor_rx.recv().await.is_some() {
+                let Some(msg) = pipeline.take_cursor_message() else {
+                    continue;
+                };
+                let payload = msg.encode();
+                if writer
+                    .lock()
+                    .await
+                    .write_frame(Channel::Control, ControlKind::Cursor as u8, 0, 0, &payload)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         }));
     }

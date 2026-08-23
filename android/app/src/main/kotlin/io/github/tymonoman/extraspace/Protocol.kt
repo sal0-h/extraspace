@@ -41,6 +41,14 @@ object Protocol {
         const val PING: Byte = 4
         const val PONG: Byte = 5
         const val ERROR: Byte = 6
+        const val CURSOR: Byte = 7
+    }
+
+    object CursorFlags {
+        const val VISIBLE: Int = 1
+        const val POSITION: Int = 2
+        const val HOTSPOT: Int = 4
+        const val BITMAP: Int = 8
     }
 
     object TouchAction {
@@ -130,6 +138,89 @@ class FrameWriter(output: OutputStream) {
  * A single touch point. Fixed 21-byte encoding rather than JSON: these arrive at
  * up to 120 Hz per finger and parse cost is not free.
  */
+/**
+ * Host -> device cursor overlay. Binary, matching `CursorMessage` in xs-proto.
+ *
+ * Position-only updates reuse the last sprite. A hide is a single zero flags byte.
+ */
+data class CursorUpdate(
+    val visible: Boolean,
+    val hasPosition: Boolean,
+    val x: Int,
+    val y: Int,
+    val hasHotspot: Boolean,
+    val hotX: Int,
+    val hotY: Int,
+    val bitmap: ByteArray?,
+    val bitmapWidth: Int,
+    val bitmapHeight: Int,
+) {
+    companion object {
+        fun hide(): CursorUpdate = CursorUpdate(
+            visible = false,
+            hasPosition = false,
+            x = 0,
+            y = 0,
+            hasHotspot = false,
+            hotX = 0,
+            hotY = 0,
+            bitmap = null,
+            bitmapWidth = 0,
+            bitmapHeight = 0,
+        )
+
+        fun decode(payload: ByteArray): CursorUpdate? {
+            if (payload.isEmpty()) return null
+            val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+            val flags = bb.get().toInt() and 0xff
+            var hasPosition = false
+            var x = 0
+            var y = 0
+            if (flags and Protocol.CursorFlags.POSITION != 0) {
+                if (bb.remaining() < 8) return null
+                x = bb.int
+                y = bb.int
+                hasPosition = true
+            }
+            var hasHotspot = false
+            var hotX = 0
+            var hotY = 0
+            if (flags and Protocol.CursorFlags.HOTSPOT != 0) {
+                if (bb.remaining() < 4) return null
+                hotX = bb.short.toInt()
+                hotY = bb.short.toInt()
+                hasHotspot = true
+            }
+            var bitmap: ByteArray? = null
+            var bitmapWidth = 0
+            var bitmapHeight = 0
+            if (flags and Protocol.CursorFlags.BITMAP != 0) {
+                if (bb.remaining() < 4) return null
+                bitmapWidth = bb.short.toInt() and 0xffff
+                bitmapHeight = bb.short.toInt() and 0xffff
+                val pixels = bitmapWidth * bitmapHeight * 4
+                if (pixels < 0 || bb.remaining() != pixels) return null
+                bitmap = ByteArray(pixels)
+                bb.get(bitmap)
+            } else if (bb.remaining() != 0) {
+                return null
+            }
+            return CursorUpdate(
+                visible = flags and Protocol.CursorFlags.VISIBLE != 0,
+                hasPosition = hasPosition,
+                x = x,
+                y = y,
+                hasHotspot = hasHotspot,
+                hotX = hotX,
+                hotY = hotY,
+                bitmap = bitmap,
+                bitmapWidth = bitmapWidth,
+                bitmapHeight = bitmapHeight,
+            )
+        }
+    }
+}
+
 data class TouchEvent(val action: Byte, val slot: Int, val x: Double, val y: Double) {
     fun encode(): ByteArray =
         ByteBuffer.allocate(TOUCH_PAYLOAD_LEN).order(ByteOrder.LITTLE_ENDIAN).apply {

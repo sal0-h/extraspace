@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     println!("  pipewire node {}", session.node_id());
 
-    let (pipeline, mut frames) = VideoPipeline::new(
+    let (pipeline, mut frames, _cursor) = VideoPipeline::new(
         session.node_id(),
         VideoConfig {
             width: WIDTH,

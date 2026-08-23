@@ -10,6 +10,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.core.view.WindowCompat
@@ -28,6 +29,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var statusView: TextView
+    private lateinit var cursorOverlay: CursorOverlay
     private var decoder: VideoDecoder? = null
     private var connection: ConnectionManager? = null
     private var camera: CameraSource? = null
@@ -66,6 +68,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         setContentView(R.layout.activity_mirror)
         surfaceView = findViewById(R.id.surface)
         statusView = findViewById(R.id.status)
+        cursorOverlay = CursorOverlay(findViewById<ImageView>(R.id.cursor), surfaceView)
 
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -112,6 +115,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         main.post {
             streamWidth = width
             streamHeight = height
+            cursorOverlay.setStreamSize(width, height)
             decoder?.start(width, height, null)
             Log.i(TAG, "stream configured ${width}x$height @$framerate")
         }
@@ -141,12 +145,17 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         }
     }
 
+    override fun onCursor(update: CursorUpdate) {
+        cursorOverlay.submit(update)
+    }
+
     override fun onConnected() {
         showStatus(null)
     }
 
     override fun onDisconnected(reason: String) {
         Log.w(TAG, "disconnected: $reason")
+        cursorOverlay.hide()
         showStatus(getString(R.string.disconnected, reason))
     }
 

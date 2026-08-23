@@ -32,6 +32,7 @@ class ConnectionManager(
         fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean)
         /** Host asked us to start or stop the camera. */
         fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int)
+        fun onCursor(update: CursorUpdate)
         fun onConnected()
         fun onDisconnected(reason: String)
     }
@@ -93,6 +94,14 @@ class ConnectionManager(
                             json.optInt("framerate", 30),
                             json.optInt("bitrate_kbps", 8000),
                         )
+                    }
+                    Protocol.ControlKind.CURSOR -> {
+                        val update = CursorUpdate.decode(payload)
+                        if (update == null) {
+                            Log.w(TAG, "malformed cursor update (${payload.size} bytes)")
+                        } else {
+                            callbacks.onCursor(update)
+                        }
                     }
                     Protocol.ControlKind.PING -> {
                         // Echo the timestamp back untouched so the host can measure

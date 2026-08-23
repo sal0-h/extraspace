@@ -3,8 +3,12 @@
 //! The pipeline is deliberately boring:
 //!
 //! ```text
-//! rust PipeWire capture + cursor overlay -> appsrc -> videorate(drop-only)
+//! rust PipeWire capture -> appsrc -> videorate(drop-only)
 //!            -> videoconvert -> I420 -> <encoder> -> h264parse -> appsink
+//!
+//! Cursor metadata is forwarded on the control channel; it is not baked into
+//! the H.264 stream. A cursor-only PipeWire buffer therefore does not push a
+//! video frame.
 //! ```
 //!
 //! Capture is a single PipeWire consumer. A second client on the same mutter
@@ -137,7 +141,10 @@ pub struct VideoPipeline {
 impl VideoPipeline {
     /// Builds the pipeline for a mutter PipeWire node. Call [`start`](Self::start)
     /// to begin producing frames.
-    pub fn new(node_id: u32, config: VideoConfig) -> Result<(Self, mpsc::Receiver<EncodedFrame>)> {
+    pub fn new(
+        node_id: u32,
+        config: VideoConfig,
+    ) -> Result<(Self, mpsc::Receiver<EncodedFrame>, mpsc::Receiver<()>)> {
         gst::init()?;
 
         let encoder = Encoder::detect().ok_or(Error::NoEncoder)?;
@@ -234,7 +241,8 @@ impl VideoPipeline {
         pipeline.add_many(encode_elements)?;
         gst::Element::link_many(encode_elements)?;
 
-        let hub = cursor::CursorHub::new(config.framerate);
+        let (cursor_tx, cursor_rx) = mpsc::channel(1);
+        let hub = cursor::CursorHub::new(config.framerate, cursor_tx);
         hub.attach_appsrc(overlay_src.clone());
 
         pacing::attach_buffer_probe(overlay_src.upcast_ref(), "src", &capture_pace);
@@ -315,7 +323,14 @@ impl VideoPipeline {
                 capture: Mutex::new(None),
             },
             rx,
+            cursor_rx,
         ))
+    }
+
+    /// Newest cursor overlay message. Stale positions are overwritten in the hub
+    /// so the tablet never has to drain a backlog of pointer motion.
+    pub fn take_cursor_message(&self) -> Option<xs_proto::CursorMessage> {
+        self.hub.take_cursor_message()
     }
 
     pub fn start(&self) -> Result<()> {
