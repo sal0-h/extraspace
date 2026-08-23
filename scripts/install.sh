@@ -26,7 +26,10 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   bold "Uninstalling Extraspace"
   rm -f "$BIN_DIR/$BIN_NAME" && ok "removed $BIN_DIR/$BIN_NAME"
   rm -f "$DESKTOP_DIR/$APP_ID.desktop" && ok "removed desktop entry"
+  rm -f "$HOME/.config/autostart/$APP_ID.desktop" && ok "removed autostart"
   rm -f "$ICON_DIR/$APP_ID.svg" && ok "removed icon"
+  rm -f "$DATA_DIR/extraspace/extraspace.apk" && ok "removed companion APK"
+  rmdir "$DATA_DIR/extraspace" 2>/dev/null || true
   update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
   gtk-update-icon-cache -f -t "$DATA_DIR/icons/hicolor" 2>/dev/null || true
   echo
@@ -51,6 +54,29 @@ fi
 mkdir -p "$BIN_DIR"
 install -m755 "$BINARY" "$BIN_DIR/$BIN_NAME"
 ok "installed $BIN_DIR/$BIN_NAME"
+
+# --- companion APK -----------------------------------------------------------
+# Desktop launches start with cwd=$HOME, so the relative android/ tree in the
+# repo is invisible. Keep a copy next to the other user data so the host can
+# still push upgrades.
+SHARE_DIR="$DATA_DIR/extraspace"
+APK_SRC=""
+for candidate in \
+  "$REPO_ROOT/android/app/build/outputs/apk/release/app-release.apk" \
+  "$REPO_ROOT/android/app/build/outputs/apk/debug/app-debug.apk"
+do
+  if [[ -f "$candidate" ]]; then
+    APK_SRC="$candidate"
+    break
+  fi
+done
+if [[ -n "$APK_SRC" ]]; then
+  mkdir -p "$SHARE_DIR"
+  install -m644 "$APK_SRC" "$SHARE_DIR/extraspace.apk"
+  ok "installed $SHARE_DIR/extraspace.apk"
+else
+  warn "no companion APK in the tree; tablet upgrades will be skipped until you build one"
+fi
 
 # --- icon --------------------------------------------------------------------
 mkdir -p "$ICON_DIR"
@@ -79,6 +105,27 @@ StartupWMClass=$BIN_NAME
 EOF
 ok "installed desktop entry"
 
+# --- autostart ---------------------------------------------------------------
+# auto_connect is on in the frozen config, so a login is enough: plug the
+# tablet in and Extra Display starts without hunting for a terminal.
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+mkdir -p "$AUTOSTART_DIR"
+cat > "$AUTOSTART_DIR/$APP_ID.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Extraspace
+GenericName=Tablet Display
+Comment=Use an Android tablet as an extra display and webcam
+Exec=$BIN_DIR/$BIN_NAME
+Icon=$APP_ID
+Terminal=false
+Categories=Utility;GTK;GNOME;
+StartupNotify=true
+StartupWMClass=$BIN_NAME
+X-GNOME-Autostart-enabled=true
+EOF
+ok "installed autostart (disable in GNOME Tweaks / Startup Applications if you do not want it at login)"
+
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -f -t "$DATA_DIR/icons/hicolor" 2>/dev/null || true
 
@@ -94,4 +141,4 @@ esac
 echo
 bold "Done."
 echo "Find \"Extraspace\" in your applications, or run: $BIN_NAME"
-echo "Remove it again with: ./scripts/install.sh --uninstall"
+echo "It also starts at login. Remove it again with: ./scripts/install.sh --uninstall"

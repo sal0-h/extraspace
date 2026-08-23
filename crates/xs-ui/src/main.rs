@@ -67,13 +67,23 @@ fn bundled_apk() -> Option<PathBuf> {
         return path.exists().then_some(path);
     }
 
-    let candidates = [
+    let mut candidates = vec![
         // A locally built APK, so `cargo run` after a Gradle build picks up your
         // changes with no extra steps.
         PathBuf::from("android/app/build/outputs/apk/release/app-release.apk"),
         PathBuf::from("android/app/build/outputs/apk/debug/app-debug.apk"),
+    ];
+    // `./scripts/install.sh` copies the APK here so a desktop/PATH launch, whose
+    // cwd is not the repo, can still upgrade the tablet.
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    if let Some(data_home) = data_home {
+        candidates.push(data_home.join("extraspace").join("extraspace.apk"));
+    }
+    candidates.extend([
         PathBuf::from("/usr/share/extraspace/extraspace.apk"),
         PathBuf::from("/usr/local/share/extraspace/extraspace.apk"),
-    ];
+    ]);
     candidates.into_iter().find(|p| p.exists())
 }
