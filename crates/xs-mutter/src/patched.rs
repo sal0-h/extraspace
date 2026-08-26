@@ -47,7 +47,7 @@ pub fn scaled_modes_allowed() -> bool {
                     patched = %patched,
                     installed = %installed,
                     "mutter changed since it was patched, so XS_MUTTER_MODES is being ignored. \
-                     Rebuild with ~/build/mutter-patched/build-and-install.sh"
+                     Rebuild with packaging/mutter-patch/build-and-install.sh"
                 );
                 false
             }

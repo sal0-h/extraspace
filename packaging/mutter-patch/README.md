@@ -24,10 +24,12 @@ falls back to the mode that was requested, which is what the CRTC ends up using
 anyway. It touches no ABI: the soname stays `libmutter-18.so=0-64`, so
 gnome-shell does not need rebuilding.
 
-`UPSTREAM-REPORT.md` is the write-up for GNOME, ready to paste into a new issue.
-`upstream-main.patch` is the same fix ported to mutter `main`, where this code now
-lives in `meta-stream-source-virtual.c`. If upstream takes the fix, none of this
-directory is needed any more.
+This is reported upstream as [mutter#5007][], and `UPSTREAM-REPORT.md` is the
+write-up that was filed. `upstream-main.patch` is the same fix ported to mutter
+`main`, where this code now lives in `meta-stream-source-virtual.c`. If upstream
+takes the fix, none of this directory is needed any more.
+
+[mutter#5007]: https://gitlab.gnome.org/GNOME/mutter/-/issues/5007
 
 ## Using it
 

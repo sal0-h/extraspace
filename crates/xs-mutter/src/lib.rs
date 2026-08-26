@@ -89,7 +89,8 @@ pub struct DisplayConfig {
     pub source: CaptureSource,
     /// Extra sizes to advertise as non-preferred modes. A saved `monitors.xml`
     /// layout that pins a Meta-0 mode we no longer offer leaves the CRTC
-    /// unconfigured, and `get_specs` then dereferences it -- see [`Session::open`].
+    /// unconfigured, and `get_specs` then dereferences it -- see [`Session::open`]
+    /// and <https://gitlab.gnome.org/GNOME/mutter/-/issues/5007>.
     pub fallback_sizes: Vec<(u32, u32)>,
 }
 
