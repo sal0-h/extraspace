@@ -1,0 +1,27 @@
+#!/bin/sh
+# Warns when the installed mutter is no longer the one ExtraSpace's crash patch
+# was built against. Run from a pacman hook after any mutter transaction.
+#
+# Nothing is blocked: upgrades proceed normally, and ExtraSpace independently
+# refuses the scaled path when these two versions disagree, so the worst case is
+# a soft-looking tablet display rather than a logout.
+set -eu
+
+MARKER="__MARKER__"
+
+installed=$(pacman -Q mutter 2>/dev/null | awk '{print $2}' || true)
+patched=$(cat "$MARKER" 2>/dev/null || true)
+
+[ -n "$installed" ] || exit 0
+[ "$installed" = "$patched" ] && exit 0
+
+cat >&2 <<EOF
+
+  mutter is now $installed, but ExtraSpace's crash patch was built for ${patched:-nothing}.
+  gnome-shell will SIGSEGV and log you out if ExtraSpace asks it for a scaled
+  virtual monitor, so ExtraSpace has switched that off by itself.
+
+  To get the sharp display back, rebuild the patch:
+      __BUILD__
+
+EOF

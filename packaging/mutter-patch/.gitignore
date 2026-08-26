@@ -1,0 +1,8 @@
+# makepkg works in place: it clones the sources here and leaves the built
+# packages behind. Only the recipe belongs in git.
+/mutter/
+/gvdb/
+/src/
+/pkg/
+*.pkg.tar.zst
+*.log

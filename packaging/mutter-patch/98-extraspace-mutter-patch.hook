@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = mutter
+
+[Action]
+Description = Checking whether ExtraSpace's mutter crash patch survived...
+When = PostTransaction
+Exec = /usr/local/bin/extraspace-mutter-patch-check
