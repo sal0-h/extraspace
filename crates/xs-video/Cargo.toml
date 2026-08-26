@@ -16,6 +16,8 @@ tokio.workspace = true
 bytes.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
+gstreamer-allocators.workspace = true
+gstreamer-video.workspace = true
 pipewire = "0.9"
 
 [dev-dependencies]

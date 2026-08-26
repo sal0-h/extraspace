@@ -247,8 +247,12 @@ XML and took some experimentation to get right:
 From there it is a normal GStreamer pipeline:
 
 ```
-PipeWire capture + cursor overlay → appsrc → videorate (drop-only) → videoconvert → x264enc → h264parse → appsink → USB
+PipeWire capture + cursor overlay → appsrc → videorate (drop-only) → vapostproc → vah264lpenc → h264parse → appsink → USB
 ```
+
+Frames are requested from mutter as dma-bufs, so they stay on the GPU from
+compositing through to encode. Where the VA-API plugin is missing, the same
+pipeline runs with `videoconvert → x264enc` over copied frames instead.
 
 and on the tablet, `MediaCodec` → `TextureView`. Touches travel back on a separate
 socket and become `NotifyTouchDown/Motion/Up` calls, whose coordinates are already
@@ -267,6 +271,26 @@ Things that cost time, recorded so they cost you less:
   mid-range CPU, which is 2.8× more than needed, so this matters less than it sounds.
 - **`x264enc` takes kbit/s but `openh264enc` takes bit/s.** A 1000× error waiting
   to happen; the conversion lives in exactly one function.
+- **At panel resolution the cost is moving pixels, not encoding them.** A
+  2296×1428 frame is 13 MB, and the software chain moved it through DRAM four
+  times: mutter's readback, our copy, `videoconvert`, then x264. Measured on an
+  i7-1355U, `videoconvert` plus x264 cost 22.4 ms per frame — a 45 fps ceiling
+  before mutter did any work — and going from 2 to 6 x264 threads, or down to
+  `ultrafast`, recovered barely a tenth of it. VA-API encode of the same frames
+  costs about 1 ms, but swapping *only* the encoder gains nothing, because
+  uploading the frame costs what the conversion did. Taking dma-bufs from mutter
+  removes all four passes at once.
+- **A dma-buf's row pitch is not `width * 4`.** The GPU pads each row out to a
+  tile boundary: 2296 pixels are allocated as 9216 bytes rather than 9184, and
+  1316 as 5376 rather than 5264. Letting GStreamer infer the pitch from the caps
+  shifts every row and shears the image diagonally, so the pitch mutter reports
+  is attached to each buffer as a `GstVideoMeta`. Widths that happen to be
+  aligned — 1920 is exactly 15 tiles — look perfect either way, which makes this
+  a bug that only appears at the resolutions that matter. Verify at those.
+- **A slow consumer throttles the compositor.** Mutter will not produce a new
+  frame until the previous buffer comes back, so encoding speed sets the capture
+  rate rather than merely following it. Under one animated load at 1920×1080,
+  mutter delivered 14.5 fps to the software chain and 39.4 fps to the GPU one.
 - **USB 2.0 is not the bottleneck.** Raw 2000×1200@60 would need ~550 MB/s, far
   beyond the ~30 MB/s a High Speed link gives you. Encoded H.264 at 15 Mbit/s is
   under 2 MB/s — roughly 15× headroom.

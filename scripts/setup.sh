@@ -169,11 +169,18 @@ echo
 
 # ---------------------------------------------------------------- encoders
 bold "5. Encoders"
-for e in x264enc openh264enc; do
+for e in vah264lpenc vah264enc x264enc openh264enc; do
   if gst-inspect-1.0 "$e" &>/dev/null; then ok "$e available"; else warn "$e not available"; fi
 done
 if ! gst-inspect-1.0 x264enc &>/dev/null && ! gst-inspect-1.0 openh264enc &>/dev/null; then
   bad "no usable H.264 encoder -- extraspace cannot stream without one"
+fi
+# The GPU encoder is preferred when present: it lets frames arrive as dma-bufs
+# and never travel through the CPU, which is what a full-resolution panel needs.
+# Fedora ships it in gstreamer1-plugins-bad-free; Arch splits it into
+# gst-plugin-va. Software encoding is used when it is absent.
+if ! gst-inspect-1.0 vah264lpenc &>/dev/null && ! gst-inspect-1.0 vah264enc &>/dev/null; then
+  warn "no VA-API encoder -- capture will copy every frame through the CPU"
 fi
 echo
 

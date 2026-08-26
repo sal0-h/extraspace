@@ -23,10 +23,14 @@ use tracing::{debug, info, warn};
 /// An H.264 encoder we know how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoder {
-    /// Preferred: fastest, most accurate rate control, best quality per bit.
+    /// Preferred software encoder: fastest, most accurate rate control.
     X264,
     /// Fallback that ships with Fedora, so the app works with no extra installs.
     OpenH264,
+    /// VA-API on the GPU's low-power (VDENC) engine.
+    VaH264Lp,
+    /// VA-API on the general encode engine, where VDENC is absent.
+    VaH264,
 }
 
 impl Encoder {
@@ -34,6 +38,8 @@ impl Encoder {
         match self {
             Self::X264 => "x264enc",
             Self::OpenH264 => "openh264enc",
+            Self::VaH264Lp => "vah264lpenc",
+            Self::VaH264 => "vah264enc",
         }
     }
 
@@ -41,11 +47,28 @@ impl Encoder {
         match self {
             Self::X264 => "x264 (software, recommended)",
             Self::OpenH264 => "OpenH264 (software, fallback)",
+            Self::VaH264Lp => "VA-API (GPU, low-power engine)",
+            Self::VaH264 => "VA-API (GPU)",
         }
+    }
+
+    /// Whether this encoder consumes GPU surfaces rather than system memory.
+    ///
+    /// At panel resolution a frame is 13 MB, and the measured cost of the whole
+    /// software chain is dominated by moving those bytes rather than by the
+    /// encode itself, so a GPU encoder is only worth having if the frames reach
+    /// it without a trip through the CPU.
+    pub fn is_gpu(self) -> bool {
+        matches!(self, Self::VaH264Lp | Self::VaH264)
     }
 
     /// Encoders in descending order of preference.
     pub const PREFERENCE: [Encoder; 2] = [Encoder::X264, Encoder::OpenH264];
+
+    /// GPU encoders in descending order of preference. The low-power engine is
+    /// first: it is a separate fixed-function block, so it leaves the render
+    /// engine free for the compositing that produced the frame.
+    pub const GPU_PREFERENCE: [Encoder; 2] = [Encoder::VaH264Lp, Encoder::VaH264];
 
     /// Whether this encoder's element is registered in the local GStreamer install.
     pub fn is_available(self) -> bool {
@@ -61,16 +84,28 @@ impl Encoder {
                 "x264enc not found, falling back to openh264enc. For lower CPU use and better \
                  quality install gstreamer1-plugins-ugly."
             ),
-            None => {}
+            // `PREFERENCE` holds only software encoders, so nothing else can
+            // come out of this search.
+            _ => {}
         }
         found
     }
 
-    /// `bitrate` is kbit/s for x264enc but bit/s for openh264enc. Getting this
-    /// wrong is a 1000x error, so the conversion lives in exactly one place.
+    /// Best GPU encoder present, or `None` when there is no VA-API plugin.
+    pub fn detect_gpu() -> Option<Self> {
+        let found = Self::GPU_PREFERENCE.into_iter().find(|e| e.is_available());
+        if let Some(encoder) = found {
+            info!(element = encoder.element_name(), "using GPU encoder");
+        }
+        found
+    }
+
+    /// `bitrate` is kbit/s for x264enc and the VA encoders but bit/s for
+    /// openh264enc. Getting this wrong is a 1000x error, so the conversion lives
+    /// in exactly one place.
     fn bitrate_property_value(self, kbps: u32) -> u32 {
         match self {
-            Self::X264 => kbps,
+            Self::X264 | Self::VaH264Lp | Self::VaH264 => kbps,
             Self::OpenH264 => kbps.saturating_mul(1000),
         }
     }
@@ -104,6 +139,16 @@ impl Encoder {
                 .property_from_str("rate-control", "bitrate")
                 .property_from_str("complexity", "low")
                 .property("gop-size", keyframe_interval_frames(framerate))
+                .build()?,
+            // Rate control is left at the element's default (CBR), which the
+            // adaptive controller can steer predictably. B-frames would reorder
+            // output and add a frame of latency for a display that is being
+            // driven live, and one reference frame is all a screen cast needs.
+            Self::VaH264Lp | Self::VaH264 => e
+                .property("bitrate", self.bitrate_property_value(kbps))
+                .property("key-int-max", keyframe_interval_frames(framerate))
+                .property("b-frames", 0u32)
+                .property("ref-frames", 1u32)
                 .build()?,
         };
         debug!(
@@ -146,6 +191,18 @@ mod tests {
         // The whole reason this conversion is centralised.
         assert_eq!(Encoder::X264.bitrate_property_value(15_000), 15_000);
         assert_eq!(Encoder::OpenH264.bitrate_property_value(15_000), 15_000_000);
+        // The VA encoders document their bitrate in kbps, like x264, so the
+        // adaptive controller needs no special case for them.
+        assert_eq!(Encoder::VaH264Lp.bitrate_property_value(15_000), 15_000);
+        assert_eq!(Encoder::VaH264.bitrate_property_value(15_000), 15_000);
+    }
+
+    #[test]
+    fn only_va_encoders_are_gpu() {
+        assert!(Encoder::VaH264Lp.is_gpu());
+        assert!(Encoder::VaH264.is_gpu());
+        assert!(!Encoder::X264.is_gpu());
+        assert!(!Encoder::OpenH264.is_gpu());
     }
 
     #[test]

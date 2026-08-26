@@ -9,15 +9,24 @@
 //! cargo run -p xs-video --example capture_test
 //! ```
 
+//! `XS_MIRROR=eDP-1` mirrors an existing panel instead of creating a virtual
+//! monitor, which exercises the same capture and encode path without
+//! rearranging the desktop. `XS_WIDTH`/`XS_HEIGHT`/`XS_SECONDS` override the
+//! defaults below.
+
 use std::time::{Duration, Instant};
 
 use xs_mutter::{CaptureSource, CursorMode, DisplayConfig};
 use xs_video::{VideoConfig, VideoPipeline};
 
-const WIDTH: u32 = 1332;
-const HEIGHT: u32 = 800;
 const FRAMERATE: u32 = 60;
-const CAPTURE_FOR: Duration = Duration::from_secs(5);
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,24 +37,44 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    println!("creating a {WIDTH}x{HEIGHT}@{FRAMERATE} virtual monitor...");
+    let width = env_u32("XS_WIDTH", 1332);
+    let height = env_u32("XS_HEIGHT", 800);
+    let capture_for = Duration::from_secs(env_u32("XS_SECONDS", 5) as u64);
+    let scale: f64 = std::env::var("XS_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let source = match std::env::var("XS_MIRROR") {
+        Ok(connector) => {
+            println!("mirroring {connector}...");
+            CaptureSource::Monitor(connector)
+        }
+        Err(_) => {
+            println!("creating a {width}x{height}@{FRAMERATE} virtual monitor...");
+            CaptureSource::Virtual
+        }
+    };
     let session = xs_mutter::Session::open(DisplayConfig {
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         refresh_rate: FRAMERATE as f64,
+        scale,
         cursor_mode: CursorMode::Metadata,
-        source: CaptureSource::Virtual,
+        source,
+        fallback_sizes: Vec::new(),
     })
     .await?;
     println!("  pipewire node {}", session.node_id());
+    let (width, height) = session.effective_size();
 
     let (pipeline, mut frames, _cursor) = VideoPipeline::new(
         session.node_id(),
         VideoConfig {
-            width: WIDTH,
-            height: HEIGHT,
+            width,
+            height,
             framerate: FRAMERATE,
             bitrate_kbps: 15_000,
+            scale,
         },
     )?;
     println!("  encoder: {}", pipeline.encoder().human_name());
@@ -58,8 +87,8 @@ async fn main() -> anyhow::Result<()> {
     let mut bytes = 0u64;
     let mut stream = Vec::new();
 
-    println!("\ncapturing for {}s...", CAPTURE_FOR.as_secs());
-    let deadline = tokio::time::Instant::now() + CAPTURE_FOR;
+    println!("\ncapturing for {}s...", capture_for.as_secs());
+    let deadline = tokio::time::Instant::now() + capture_for;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -85,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let (mutter_frames, pushed, push_fail, copy_max_us) = pipeline.take_capture_counts();
     pipeline.stop();
     session.close().await?;
 
@@ -100,6 +130,16 @@ async fn main() -> anyhow::Result<()> {
     println!("  frames              {count}");
     println!("  keyframes           {keyframes}");
     println!("  measured rate       {fps:.1} fps  (asked for {FRAMERATE})");
+    println!(
+        "  mutter delivered    {} frames ({:.1} fps)",
+        mutter_frames,
+        mutter_frames as f64 / elapsed
+    );
+    println!("  pushed / rejected   {pushed} / {push_fail}");
+    println!(
+        "  worst copy          {:.1} ms  (0 on the dma-buf path -- nothing is copied)",
+        copy_max_us as f64 / 1000.0
+    );
     println!("  measured bitrate    {mbps:.1} Mbps  (asked for 15.0)");
     println!("  total bytes         {bytes}");
 

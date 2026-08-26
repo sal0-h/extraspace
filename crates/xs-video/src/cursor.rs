@@ -12,7 +12,7 @@
 //! tablet can composite an overlay. A cursor-only buffer therefore costs a
 //! sprite/position message, not a convert+encode+USB cycle.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -68,6 +68,13 @@ pub struct CursorHub {
     framerate: u32,
     seen_cursor: AtomicBool,
     seen_video: AtomicBool,
+    /// PipeWire process() callbacks that carried a video chunk.
+    mutter_frames: AtomicU64,
+    /// Frames successfully pushed into appsrc.
+    pushed_frames: AtomicU64,
+    /// appsrc rejected the buffer (downstream full).
+    push_fail: AtomicU64,
+    copy_max_us: AtomicU64,
 }
 
 pub struct Capture {
@@ -80,6 +87,11 @@ struct CaptureData {
     format: spa::param::video::VideoInfoRaw,
     warned_unmapped: bool,
     warned_format: bool,
+    /// Skip packing video; used to isolate PipeWire dequeue from the CPU copy.
+    dequeue_only: bool,
+    /// The layout requested from mutter, when frames should arrive as dma-bufs.
+    dmabuf: Option<DmaBufImport>,
+    allocator: Option<gstreamer_allocators::DmaBufAllocator>,
 }
 
 impl CursorHub {
@@ -93,11 +105,40 @@ impl CursorHub {
             framerate: framerate.max(1),
             seen_cursor: AtomicBool::new(false),
             seen_video: AtomicBool::new(false),
+            mutter_frames: AtomicU64::new(0),
+            pushed_frames: AtomicU64::new(0),
+            push_fail: AtomicU64::new(0),
+            copy_max_us: AtomicU64::new(0),
         })
     }
 
     pub fn attach_appsrc(&self, appsrc: AppSrc) {
         *self.appsrc.lock().expect("cursor appsrc lock") = Some(appsrc);
+    }
+
+    /// `(mutter_frames, pushed, push_fail, copy_max_us)` since the previous take.
+    pub fn take_capture_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.mutter_frames.swap(0, Ordering::Relaxed),
+            self.pushed_frames.swap(0, Ordering::Relaxed),
+            self.push_fail.swap(0, Ordering::Relaxed),
+            self.copy_max_us.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    pub fn observe_copy_us(&self, copy_us: u64) {
+        let mut current = self.copy_max_us.load(Ordering::Relaxed);
+        while copy_us > current {
+            match self.copy_max_us.compare_exchange_weak(
+                current,
+                copy_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
     }
 
     pub fn take_cursor_message(&self) -> Option<CursorMessage> {
@@ -261,6 +302,39 @@ impl CursorHub {
         self.push_frame(frame);
     }
 
+    /// Pushes a GPU frame straight through, with no pixel access on this side.
+    fn on_dmabuf_frame(
+        &self,
+        buffer: gst::Buffer,
+        width: u32,
+        height: u32,
+        drm_format: &str,
+        stride: i32,
+    ) {
+        if !self.seen_video.swap(true, Ordering::Relaxed) {
+            info!(
+                width,
+                height,
+                drm_format,
+                stride,
+                unpadded = width * 4,
+                "dma-buf frame arrived"
+            );
+            let caps = gst::Caps::builder("video/x-raw")
+                .features(["memory:DMABuf"])
+                .field("format", "DMA_DRM")
+                .field("drm-format", drm_format)
+                .field("width", width as i32)
+                .field("height", height as i32)
+                .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
+                .build();
+            if let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() {
+                appsrc.set_caps(Some(&caps));
+            }
+        }
+        self.push_buffer(buffer);
+    }
+
     fn set_appsrc_caps(&self, width: u32, height: u32) {
         let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() else {
             return;
@@ -275,10 +349,13 @@ impl CursorHub {
     }
 
     fn push_frame(&self, frame: VideoFrame) {
+        self.push_buffer(gst::Buffer::from_mut_slice(frame.pixels));
+    }
+
+    fn push_buffer(&self, mut buffer: gst::Buffer) {
         let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() else {
             return;
         };
-        let mut buffer = gst::Buffer::from_mut_slice(frame.pixels);
         {
             let buffer = buffer.get_mut().expect("new capture buffer is writable");
             buffer.set_pts(self.now_pts());
@@ -287,7 +364,10 @@ impl CursorHub {
             ));
         }
         if let Err(err) = appsrc.push_buffer(buffer) {
+            self.push_fail.fetch_add(1, Ordering::Relaxed);
             debug!(error = %err, "capture push dropped");
+        } else {
+            self.pushed_frames.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -314,11 +394,12 @@ impl Capture {
         width: u32,
         height: u32,
         hub: Arc<CursorHub>,
+        dmabuf: Option<DmaBufImport>,
     ) -> Result<Self, String> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let join = std::thread::Builder::new()
             .name("xs-capture".into())
-            .spawn(move || capture_thread(node_id, width, height, hub, ready_tx))
+            .spawn(move || capture_thread(node_id, width, height, hub, dmabuf, ready_tx))
             .map_err(|e| e.to_string())?;
         let loop_ptr = ready_rx
             .recv_timeout(std::time::Duration::from_secs(3))
@@ -351,6 +432,7 @@ fn capture_thread(
     width: u32,
     height: u32,
     hub: Arc<CursorHub>,
+    dmabuf: Option<DmaBufImport>,
     ready: std::sync::mpsc::Sender<usize>,
 ) {
     pw::init();
@@ -365,7 +447,7 @@ fn capture_thread(
     let loop_ptr = mainloop.as_raw_ptr() as usize;
     let _ = ready.send(loop_ptr);
 
-    if let Err(e) = run_capture_stream(&mainloop, node_id, width, height, hub) {
+    if let Err(e) = run_capture_stream(&mainloop, node_id, width, height, hub, dmabuf) {
         warn!(error = %e, "screen-cast stream failed");
     }
 }
@@ -376,6 +458,7 @@ fn run_capture_stream(
     width: u32,
     height: u32,
     hub: Arc<CursorHub>,
+    dmabuf: Option<DmaBufImport>,
 ) -> Result<(), String> {
     let context = pw::context::ContextRc::new(mainloop, None).map_err(|e| e.to_string())?;
     let core = context.connect_rc(None).map_err(|e| e.to_string())?;
@@ -387,11 +470,20 @@ fn run_capture_stream(
     let stream = pw::stream::StreamBox::new(&core, "extraspace-capture", props)
         .map_err(|e| e.to_string())?;
 
+    let dequeue_only = std::env::var("EXTRASPACE_PIPELINE")
+        .map(|v| v == "dequeue")
+        .unwrap_or(false);
+    let allocator = dmabuf
+        .as_ref()
+        .map(|_| gstreamer_allocators::DmaBufAllocator::new());
     let data = CaptureData {
         hub,
         format: spa::param::video::VideoInfoRaw::new(),
         warned_unmapped: false,
         warned_format: false,
+        dequeue_only,
+        dmabuf: dmabuf.clone(),
+        allocator,
     };
 
     let _listener = stream
@@ -435,25 +527,57 @@ fn run_capture_stream(
                 return;
             }
             let cursor = unsafe { parse_cursor(raw) };
-            let video = unsafe { copy_video_frame(raw, data) };
             if let Some(update) = cursor {
                 data.hub.store_cursor(update);
             }
-            if let Some(frame) = video {
-                data.hub.on_video_frame(frame);
+            if data.dequeue_only {
+                if unsafe { video_chunk_size(raw) } > 0 {
+                    data.hub.mutter_frames.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if let Some(import) = data.dmabuf.clone().filter(|_| unsafe { is_dmabuf(raw) }) {
+                let stride = unsafe { video_chunk_stride(raw) };
+                if let Some(buffer) = unsafe { wrap_dmabuf_frame(raw, data, &import) } {
+                    data.hub.mutter_frames.fetch_add(1, Ordering::Relaxed);
+                    let width = data.format.size().width;
+                    let height = data.format.size().height;
+                    data.hub
+                        .on_dmabuf_frame(buffer, width, height, &import.drm_format(), stride);
+                }
+            } else {
+                let copied = std::time::Instant::now();
+                let video = unsafe { copy_video_frame(raw, data) };
+                if video.is_some() {
+                    data.hub
+                        .observe_copy_us(copied.elapsed().as_micros() as u64);
+                    data.hub.mutter_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(frame) = video {
+                    data.hub.on_video_frame(frame);
+                }
             }
             unsafe { stream.queue_raw_buffer(raw) };
         })
         .register()
         .map_err(|e| e.to_string())?;
 
+    // The dma-buf format is offered first so mutter prefers it, with the
+    // system-memory format left in place as the fallback.
+    let dmabuf_bytes = dmabuf
+        .as_ref()
+        .map(|import| video_enum_format_dmabuf_pod(width, height, import));
     let format_bytes = video_enum_format_pod(width, height);
     let meta_bytes = cursor_meta_pod();
-    let buffers_bytes = cpu_buffers_pod();
+    let buffers_bytes = buffers_pod(dmabuf.is_some());
     let format_pod = spa::pod::Pod::from_bytes(&format_bytes).ok_or("video format pod")?;
     let meta_pod = spa::pod::Pod::from_bytes(&meta_bytes).ok_or("cursor meta pod")?;
     let buffers_pod = spa::pod::Pod::from_bytes(&buffers_bytes).ok_or("buffers pod")?;
-    let mut params = [format_pod, meta_pod, buffers_pod];
+    let dmabuf_pod = match dmabuf_bytes.as_ref() {
+        Some(bytes) => Some(spa::pod::Pod::from_bytes(bytes).ok_or("dma-buf format pod")?),
+        None => None,
+    };
+    let mut params: Vec<&spa::pod::Pod> = Vec::new();
+    params.extend(dmabuf_pod);
+    params.extend([format_pod, meta_pod, buffers_pod]);
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -499,14 +623,8 @@ fn video_enum_format_pod(width: u32, height: u32) -> Vec<u8> {
             Range,
             Rectangle,
             spa::utils::Rectangle { width, height },
-            spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
-            }
+            spa::utils::Rectangle { width, height },
+            spa::utils::Rectangle { width, height }
         ),
         property!(
             FormatProperties::VideoFramerate,
@@ -524,10 +642,13 @@ fn video_enum_format_pod(width: u32, height: u32) -> Vec<u8> {
     serialize_pod(spa::pod::Value::Object(obj))
 }
 
-fn cpu_buffers_pod() -> Vec<u8> {
+fn buffers_pod(dmabuf: bool) -> Vec<u8> {
     use spa::pod::{Object, Property, Value};
 
-    let types = (1 << spa::sys::SPA_DATA_MemPtr) | (1 << spa::sys::SPA_DATA_MemFd);
+    let mut types = (1 << spa::sys::SPA_DATA_MemPtr) | (1 << spa::sys::SPA_DATA_MemFd);
+    if dmabuf {
+        types |= 1 << spa::sys::SPA_DATA_DmaBuf;
+    }
     let obj = Object {
         type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),
@@ -537,6 +658,91 @@ fn cpu_buffers_pod() -> Vec<u8> {
         )],
     };
     serialize_pod(spa::pod::Value::Object(obj))
+}
+
+/// A dma-buf layout the GPU can import, as negotiated with mutter.
+#[derive(Debug, Clone)]
+pub struct DmaBufImport {
+    /// SPA/GStreamer video format name, e.g. `BGRA`.
+    pub spa_format: &'static str,
+    /// The same layout as a DRM fourcc, e.g. `AR24`, for the GStreamer caps.
+    pub fourcc: &'static str,
+    /// DRM format modifier describing the tiling.
+    pub modifier: u64,
+}
+
+impl DmaBufImport {
+    fn video_format(&self) -> spa::param::video::VideoFormat {
+        use spa::param::video::VideoFormat;
+        match self.spa_format {
+            "BGRA" => VideoFormat::BGRA,
+            "RGBA" => VideoFormat::RGBA,
+            "RGBx" => VideoFormat::RGBx,
+            _ => VideoFormat::BGRx,
+        }
+    }
+
+    fn gst_format(&self) -> gstreamer_video::VideoFormat {
+        match self.spa_format {
+            "BGRA" => gstreamer_video::VideoFormat::Bgra,
+            "RGBA" => gstreamer_video::VideoFormat::Rgba,
+            "RGBx" => gstreamer_video::VideoFormat::Rgbx,
+            _ => gstreamer_video::VideoFormat::Bgrx,
+        }
+    }
+
+    /// `drm-format` field value, e.g. `AR24:0x0100000000000002`.
+    fn drm_format(&self) -> String {
+        format!("{}:{:#018x}", self.fourcc, self.modifier)
+    }
+}
+
+/// EnumFormat offering exactly one dma-buf layout.
+///
+/// A single modifier is deliberate: offering a choice means the producer may
+/// hand back a choice of its own, which then has to be fixated in a second
+/// round of negotiation. The GPU can import one layout for this format, so
+/// there is nothing to choose between -- and if mutter cannot produce it, the
+/// system-memory EnumFormat that follows this one is used instead.
+fn video_enum_format_dmabuf_pod(width: u32, height: u32, import: &DmaBufImport) -> Vec<u8> {
+    use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use spa::pod::{Object, Property, PropertyFlags, Value};
+    use spa::utils::Id;
+
+    let obj = Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: vec![
+            Property::new(
+                FormatProperties::MediaType.as_raw(),
+                Value::Id(Id(MediaType::Video.as_raw())),
+            ),
+            Property::new(
+                FormatProperties::MediaSubtype.as_raw(),
+                Value::Id(Id(MediaSubtype::Raw.as_raw())),
+            ),
+            Property::new(
+                FormatProperties::VideoFormat.as_raw(),
+                Value::Id(Id(import.video_format().as_raw())),
+            ),
+            // Mandatory: its presence is what tells the producer this client can
+            // take dma-bufs at all.
+            Property {
+                key: FormatProperties::VideoModifier.as_raw(),
+                flags: PropertyFlags::MANDATORY,
+                value: Value::Long(import.modifier as i64),
+            },
+            Property::new(
+                FormatProperties::VideoSize.as_raw(),
+                Value::Rectangle(spa::utils::Rectangle { width, height }),
+            ),
+            Property::new(
+                FormatProperties::VideoFramerate.as_raw(),
+                Value::Fraction(spa::utils::Fraction { num: 0, denom: 1 }),
+            ),
+        ],
+    };
+    serialize_pod(Value::Object(obj))
 }
 
 fn cursor_meta_pod() -> Vec<u8> {
@@ -650,6 +856,117 @@ unsafe fn parse_cursor(pw_buf: *mut pw_sys::pw_buffer) -> Option<CursorUpdate> {
         }));
     }
     None
+}
+
+/// Whether mutter filled this buffer with a dma-buf rather than mapped memory.
+/// Both are offered during negotiation, so the answer can change per stream.
+unsafe fn is_dmabuf(pw_buf: *mut pw_sys::pw_buffer) -> bool {
+    let spa_buf = (*pw_buf).buffer;
+    if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+        return false;
+    }
+    (*(*spa_buf).datas).type_ == spa::sys::SPA_DATA_DmaBuf
+}
+
+/// Row pitch mutter allocated, which for a tiled buffer is padded past
+/// `width * 4`.
+unsafe fn video_chunk_stride(pw_buf: *mut pw_sys::pw_buffer) -> i32 {
+    let spa_buf = (*pw_buf).buffer;
+    if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+        return 0;
+    }
+    let spa_data = (*spa_buf).datas;
+    if (*spa_data).chunk.is_null() {
+        return 0;
+    }
+    (*(*spa_data).chunk).stride
+}
+
+unsafe fn video_chunk_size(pw_buf: *mut pw_sys::pw_buffer) -> u32 {
+    let spa_buf = (*pw_buf).buffer;
+    if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+        return 0;
+    }
+    let spa_data = (*spa_buf).datas;
+    if (*spa_data).chunk.is_null() {
+        return 0;
+    }
+    (*(*spa_data).chunk).size
+}
+
+/// Wraps a dma-buf frame as a GStreamer buffer without touching the pixels.
+///
+/// The fd is duplicated so the PipeWire buffer can be requeued immediately;
+/// GStreamer closes its copy when the buffer is released, and the underlying
+/// GEM object stays alive as long as either fd is open.
+unsafe fn wrap_dmabuf_frame(
+    pw_buf: *mut pw_sys::pw_buffer,
+    data: &mut CaptureData,
+    import: &DmaBufImport,
+) -> Option<gst::Buffer> {
+    use gstreamer_allocators::prelude::DmaBufAllocatorExtManual;
+
+    let spa_buf = (*pw_buf).buffer;
+    if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+        return None;
+    }
+    let spa_data = (*spa_buf).datas;
+    if (*spa_data).type_ != spa::sys::SPA_DATA_DmaBuf || (*spa_data).chunk.is_null() {
+        return None;
+    }
+    let chunk = *(*spa_data).chunk;
+    if chunk.size == 0 {
+        return None;
+    }
+    let fd = (*spa_data).fd as std::os::fd::RawFd;
+    if fd < 0 {
+        return None;
+    }
+    let allocator = data.allocator.as_ref()?;
+    let owned = match unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned() {
+        Ok(owned) => owned,
+        Err(e) => {
+            warn!(error = %e, "could not duplicate the dma-buf fd for this frame");
+            return None;
+        }
+    };
+    let size = (*spa_data).maxsize as usize;
+    let memory = match unsafe { allocator.alloc_dmabuf(owned, size) } {
+        Ok(memory) => memory,
+        Err(e) => {
+            warn!(error = %e, "could not wrap the dma-buf as GStreamer memory");
+            return None;
+        }
+    };
+    let mut buffer = gst::Buffer::new();
+    let width = data.format.size().width;
+    let height = data.format.size().height;
+    {
+        let buffer = buffer.get_mut()?;
+        buffer.append_memory(memory);
+        // The row pitch is whatever the GPU allocated, which for a width that is
+        // not a multiple of the tile size is wider than `width * 4`. Without the
+        // real value here every row is read at the wrong offset and the image
+        // shears diagonally, so it is carried explicitly rather than inferred.
+        let stride = if chunk.stride > 0 {
+            chunk.stride
+        } else {
+            (width * 4) as i32
+        };
+        if let Err(e) = gstreamer_video::VideoMeta::add_full(
+            buffer,
+            gstreamer_video::VideoFrameFlags::empty(),
+            import.gst_format(),
+            width,
+            height,
+            &[chunk.offset as usize],
+            &[stride],
+        ) {
+            warn!(error = %e, "could not describe the dma-buf layout");
+            return None;
+        }
+    }
+    Some(buffer)
 }
 
 unsafe fn copy_video_frame(
