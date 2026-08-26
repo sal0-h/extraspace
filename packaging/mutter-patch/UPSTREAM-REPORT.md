@@ -13,7 +13,7 @@ Suggested labels: `1. Crash`, `screen cast`
 
 ### Affected version
 
-* Arch Linux, kernel 6.16, Wayland session, native KMS backend, single laptop panel (2304x1440).
+* Arch Linux, kernel 7.1.9, Wayland session, native KMS backend, single laptop panel (2304x1440).
 * mutter 50.4.
 * Still present on `main` at `82ad6279` (2026-08-25). The code moved in the
   `MetaStream` extraction, so the three unguarded sites are now:
@@ -115,10 +115,11 @@ head of `mode_infos` is the preferred one, and it is the mode the CRTC ends up
 using anyway. In `ensure_virtual_monitor()`, treat a NULL current mode as "no
 mode to compare against" and set the modes unconditionally.
 
-The patch below applies cleanly to `main` at `82ad6279`. I have been running the
-equivalent patch against 50.4 for several days across many session
-create/teardown cycles; both crashes are gone and virtual monitors behave
-normally.
+The patch below applies cleanly to `main` at `82ad6279`. I am running the
+equivalent patch against 50.4: before it, the crashes were frequent enough to log
+me out several times in an afternoon, and since it I have not reproduced either
+one across many session create/teardown cycles, with virtual monitors otherwise
+behaving normally.
 
 ```diff
 --- a/src/backends/meta-virtual-monitor.c
