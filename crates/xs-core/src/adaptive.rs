@@ -22,11 +22,12 @@ pub struct BitrateBounds {
 
 impl Default for BitrateBounds {
     fn default() -> Self {
-        // 6 Mbit/s still looks fine for text at this size; 30 is past the point
-        // of visible improvement over USB 2.0 and just wastes headroom.
+        // 6 Mbit/s still looks fine for text at 1332×800. Native 2304×1440@60
+        // needs more: 30 Mbps is only ~0.15 bits/pixel/frame under zerolatency
+        // H.264. 50 Mbps is ~6.25 MB/s, well inside USB 2.0 headroom.
         Self {
             min_kbps: 6_000,
-            max_kbps: 30_000,
+            max_kbps: 50_000,
         }
     }
 }

@@ -16,7 +16,10 @@ pub mod adaptive;
 mod session;
 
 pub use adaptive::{AdaptiveController, BitrateBounds, HealthSample};
-pub use session::{virtual_size_for, DisplayMode, SessionConfig};
+pub use session::{
+    clamp_ui_scale, fallback_sizes, logical_size_for, modes_enabled, scaled_size_for,
+    virtual_size_for, DisplayMode, SessionConfig,
+};
 
 /// Events per second the tablet reports and the controller consumes.
 pub const STATS_HZ: u64 = 2;
@@ -28,7 +31,7 @@ pub enum Command {
     Connect,
     /// Tear everything down.
     Disconnect,
-    /// Change the logical scale, e.g. 1.5. Recreates the virtual monitor.
+    /// Change GNOME UI scale on the live virtual monitor. Does not recreate Meta-0.
     SetScale(f64),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),

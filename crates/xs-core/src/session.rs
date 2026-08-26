@@ -31,6 +31,13 @@ use crate::{Command, Event, FpsCounter, State, Stats};
 /// How often we probe round-trip latency.
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Pause between removing a virtual monitor and creating the next one.
+///
+/// mutter reloads monitors asynchronously after the old Meta-0 goes away; a new
+/// `RecordVirtual` landing inside that window is how gnome-shell ends up reading
+/// a CRTC that has no configuration yet.
+const TEARDOWN_SETTLE: Duration = Duration::from_millis(1200);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
     /// A new monitor: the desktop gets bigger.
@@ -42,7 +49,8 @@ pub enum DisplayMode {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub mode: DisplayMode,
-    /// Logical scale. See [`virtual_size_for`] for what this actually does.
+    /// GNOME UI scale on the virtual monitor. Framebuffer size is the panel;
+    /// see [`virtual_size_for`].
     pub scale: f64,
     pub framerate: u32,
     pub bounds: BitrateBounds,
@@ -71,22 +79,100 @@ impl Default for SessionConfig {
     }
 }
 
-/// Turns a panel size and a scale into the resolution to actually stream.
+/// Framebuffer size to ask mutter for.
 ///
-/// Rather than asking mutter to apply a scale factor -- which `RecordVirtual` has
-/// no way to express -- the virtual monitor is created *smaller* and the tablet
-/// upscales it to fill the panel. A 2000x1200 panel at 1.5x becomes a 1332x800
-/// monitor, so everything on it is drawn 1.5x larger. Text softens slightly from
-/// the upscale, which is a fair trade for readable UI on a 10.4" screen, and it
-/// lowers the bitrate needed at the same time.
+/// This divides the panel by the scale, which is not what we want -- the tablet
+/// then upscales a smaller framebuffer, so text is soft. The sharp alternative is
+/// a panel-sized monitor with a GNOME logical scale, but `preferred-scale` is only
+/// reachable through `RecordVirtual`'s `modes`, and that dereferences an
+/// unconfigured CRTC in mutter 50.4 and logs the user out. Dividing is what has
+/// actually stayed up, so it is the default until libmutter is fixed;
+/// [`scaled_size_for`] is the shape the sharp path wants.
 ///
 /// Dimensions are forced even because H.264 4:2:0 chroma cannot represent an odd
 /// width or height; encoders either reject it or silently pad.
 pub fn virtual_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32, u32) {
-    let scale = scale.clamp(1.0, 3.0);
+    let scale = clamp_ui_scale(scale);
     let w = ((panel_width as f64 / scale).round() as u32).max(640);
     let h = ((panel_height as f64 / scale).round() as u32).max(480);
     (w & !1, h & !1)
+}
+
+/// Panel-sized framebuffer, trimmed so `scale` is a scale mutter will accept.
+///
+/// mutter only allows a logical size that is a whole number of pixels, so 1.75x on
+/// a 2304-wide panel is invalid (2304 / 1.75 = 1316.57) and would silently become
+/// a different scale. Trimming to 2296x1428 makes 1.75x exact at 1312x816 logical.
+/// Used with `XS_MUTTER_MODES=1`.
+pub fn scaled_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32, u32) {
+    let scale = clamp_ui_scale(scale);
+    // Every scale we offer is a multiple of a quarter, so scale = quarters / 4
+    // and the logical size is 4 * pixels / quarters.
+    let quarters = (scale * 4.0).round().max(4.0) as u32;
+    let trim = |px: u32, floor: u32| -> u32 {
+        let mut px = px.max(floor) & !1;
+        // At most `quarters` steps down, so this is a handful of iterations.
+        while px > floor && (4 * px) % quarters != 0 {
+            px -= 2;
+        }
+        px
+    };
+    (trim(panel_width, 640), trim(panel_height, 480))
+}
+
+/// Logical desktop size, i.e. how big the UI looks, for either sizing scheme.
+pub fn logical_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32, u32) {
+    let scale = clamp_ui_scale(scale);
+    if modes_enabled() {
+        let (w, h) = scaled_size_for(panel_width, panel_height, scale);
+        return (
+            (w as f64 / scale).round() as u32,
+            (h as f64 / scale).round() as u32,
+        );
+    }
+    virtual_size_for(panel_width, panel_height, scale)
+}
+
+/// Whether the panel-sized, GNOME-scaled monitor is opted into *and* safe.
+///
+/// Delegated so the size we compute cannot disagree with what the mutter session
+/// actually asks for.
+pub fn modes_enabled() -> bool {
+    xs_mutter::scaled_modes_allowed()
+}
+
+/// Sizes to advertise as extra, non-preferred modes on the virtual monitor.
+///
+/// A `monitors.xml` layout saved for an earlier Meta-0 can pin a mode; mutter
+/// reuses virtual serials, so it matches. If the pinned mode is missing, the CRTC
+/// is left unconfigured and mutter 50.4 dereferences it -- gnome-shell dies and
+/// the user is logged out. Offering every size this app has ever streamed makes
+/// that impossible.
+pub fn fallback_sizes(panel_width: u32, panel_height: u32) -> Vec<(u32, u32)> {
+    let mut sizes = vec![(panel_width & !1, panel_height & !1)];
+    for scale in SCALE_CHOICES {
+        sizes.push(scaled_size_for(panel_width, panel_height, scale));
+        // The pre-HiDPI behaviour: panel divided by the scale.
+        sizes.push((
+            ((panel_width as f64 / scale).round() as u32) & !1,
+            ((panel_height as f64 / scale).round() as u32) & !1,
+        ));
+    }
+    sizes.retain(|&(w, h)| w >= 640 && h >= 480);
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+/// Scales the UI offers, and therefore the ones a saved layout can contain.
+const SCALE_CHOICES: [f64; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// Clamps the UI scale to what mutter can put on a mode's `preferred-scale`.
+pub fn clamp_ui_scale(scale: f64) -> f64 {
+    if !scale.is_finite() {
+        return 1.5;
+    }
+    scale.clamp(1.0, 3.0)
 }
 
 type SharedWriter = Arc<Mutex<FrameWriter<OwnedWriteHalf>>>;
@@ -160,13 +246,15 @@ pub async fn run(
                 emit(State::Idle);
             }
 
-            // Scale and mode both change the monitor's geometry, so the session
-            // must be rebuilt. It takes well under a second, so the UI can present
-            // it as a live change rather than a restart.
+            // Scale and mode are both properties of the virtual monitor's mode,
+            // so the session is rebuilt. Never mid-stream: changing PipeWire
+            // params on a live virtual node re-enters the mutter code path that
+            // logs the user out.
             Command::SetScale(scale) => {
-                config.scale = scale;
+                config.scale = clamp_ui_scale(scale);
                 if let Some(session) = active.take() {
                     session.shutdown().await;
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
                     active = try_connect(&config, &events).await;
                 }
             }
@@ -175,6 +263,7 @@ pub async fn run(
                 config.mode = mode;
                 if let Some(session) = active.take() {
                     session.shutdown().await;
+                    tokio::time::sleep(TEARDOWN_SETTLE).await;
                     active = try_connect(&config, &events).await;
                 }
             }
@@ -275,7 +364,21 @@ async fn connect(
         "tablet said hello"
     );
 
-    let (width, height) = virtual_size_for(hello.width, hello.height, config.scale);
+    let scale = clamp_ui_scale(config.scale);
+    let (asked_width, asked_height) = if modes_enabled() {
+        scaled_size_for(hello.width, hello.height, scale)
+    } else {
+        virtual_size_for(hello.width, hello.height, scale)
+    };
+    let (logical_width, logical_height) = logical_size_for(hello.width, hello.height, scale);
+    info!(
+        width = asked_width,
+        height = asked_height,
+        scale,
+        logical = format!("{logical_width}x{logical_height}"),
+        gnome_scaled = modes_enabled(),
+        "sizing the virtual monitor"
+    );
 
     step("Creating the display…");
     let source = match (config.mode, &config.mirror_source) {
@@ -293,9 +396,11 @@ async fn connect(
 
     let mutter = Arc::new(
         xs_mutter::Session::open(DisplayConfig {
-            width,
-            height,
+            width: asked_width,
+            height: asked_height,
             refresh_rate: config.framerate as f64,
+            scale,
+            fallback_sizes: fallback_sizes(hello.width, hello.height),
             // Metadata, not Embedded: mutter only paints an embedded cursor
             // when the virtual monitor is damaged, so a still window freezes
             // the pointer. Cursor sprite/position is forwarded to the tablet.
@@ -304,6 +409,10 @@ async fn connect(
         })
         .await?,
     );
+
+    // Whatever mutter settled on wins: the PipeWire node only ever produces that
+    // size, so negotiating anything else would leave the tablet black.
+    let (width, height) = mutter.effective_size();
 
     step("Starting the video pipeline…");
     let start_kbps = starting_bitrate(width, height, config.framerate, config.bounds);
@@ -314,6 +423,7 @@ async fn connect(
             height,
             framerate: config.framerate,
             bitrate_kbps: start_kbps,
+            scale,
         },
     )?;
     let encoder_name = pipeline.encoder().human_name().to_string();
@@ -519,6 +629,8 @@ async fn connect(
                         // walks somewhere surprising, the only useful question is
                         // which of the three signals drove it.
                         let (capture, videorate, encoded_pace) = pipeline_pace.take_pacing();
+                        let (mutter_frames, pushed, push_fail, copy_max_us) =
+                            pipeline_pace.take_capture_counts();
                         let write = write_pace.take();
                         debug!(
                             queue = sample.decode_queue_depth,
@@ -527,6 +639,11 @@ async fn connect(
                             host_dropped = dropped,
                             device_dropped = device.frames_dropped,
                             encoded,
+                            mutter_frames,
+                            pushed,
+                            push_fail,
+                            copy_max_us,
+                            capture_frames = capture.0,
                             capture_max_ms = capture.2 / 1000,
                             rate_max_ms = videorate.2 / 1000,
                             encode_max_ms = encoded_pace.2 / 1000,
@@ -761,28 +878,76 @@ mod tests {
     }
 
     #[test]
-    fn scaling_shrinks_the_monitor_so_ui_looks_bigger() {
-        // The T Tablet's panel at the default 1.5x.
-        assert_eq!(virtual_size_for(2000, 1200, 1.5), (1332, 800));
-        assert_eq!(virtual_size_for(2000, 1200, 2.0), (1000, 600));
+    fn default_sizing_still_divides_the_panel() {
+        // Not the sharp behaviour, but the one that does not log the user out.
+        assert_eq!(virtual_size_for(2304, 1440, 1.75), (1316, 822));
+        assert_eq!(virtual_size_for(2304, 1440, 2.0), (1152, 720));
+    }
+
+    #[test]
+    fn scaled_sizing_keeps_almost_the_whole_panel() {
+        for scale in SCALE_CHOICES {
+            let (w, h) = scaled_size_for(2304, 1440, scale);
+            assert!(w >= 2304 - 12 && h >= 1440 - 12, "{w}x{h} at {scale}");
+        }
+    }
+
+    #[test]
+    fn every_offered_scale_has_a_whole_pixel_logical_size() {
+        // mutter refuses a scale whose logical size is fractional, and silently
+        // uses a different one -- which is how "1.75x" became a blurry 1.0x.
+        for scale in SCALE_CHOICES {
+            let (w, h) = scaled_size_for(2304, 1440, scale);
+            for px in [w, h] {
+                let logical = px as f64 / scale;
+                assert!(
+                    (logical - logical.round()).abs() < 1e-9,
+                    "{px} / {scale} = {logical} is not a whole number of pixels"
+                );
+            }
+        }
+        assert_eq!(scaled_size_for(2304, 1440, 1.75), (2296, 1428));
+        assert_eq!(scaled_size_for(2304, 1440, 2.0), (2304, 1440));
+    }
+
+    #[test]
+    fn fallbacks_cover_every_size_a_saved_layout_could_pin() {
+        let sizes = super::fallback_sizes(2304, 1440);
+        // The panel itself, the current 1.75x choice, and the size shipped before
+        // HiDPI -- a saved Meta-0 mode that is missing crashes gnome-shell.
+        for expected in [(2304, 1440), (2296, 1428), (1316, 822), (1152, 720)] {
+            assert!(
+                sizes.contains(&expected),
+                "{expected:?} missing from {sizes:?}"
+            );
+        }
+        assert!(sizes.iter().all(|&(w, h)| w % 2 == 0 && h % 2 == 0));
     }
 
     #[test]
     fn dimensions_are_always_even_for_h264() {
         // 4:2:0 chroma cannot represent odd dimensions; encoders fail or pad.
         for scale in [1.0, 1.1, 1.25, 1.3, 1.5, 1.75, 2.0, 2.3, 3.0] {
-            let (w, h) = virtual_size_for(2000, 1200, scale);
+            let (w, h) = virtual_size_for(2001, 1201, scale);
             assert_eq!(w % 2, 0, "width {w} odd at scale {scale}");
             assert_eq!(h % 2, 0, "height {h} odd at scale {scale}");
         }
     }
 
     #[test]
-    fn absurd_scales_are_clamped_rather_than_producing_a_useless_monitor() {
-        let (w, h) = virtual_size_for(2000, 1200, 99.0);
+    fn tiny_panels_are_raised_to_a_usable_monitor() {
+        let (w, h) = virtual_size_for(320, 240, 1.75);
         assert!(w >= 640 && h >= 480, "got {w}x{h}");
-        // Below 1.0 would mean streaming more pixels than the panel has.
         assert_eq!(virtual_size_for(2000, 1200, 0.1), (2000, 1200));
+        assert_eq!(virtual_size_for(2000, 1200, 1.0), (2000, 1200));
+    }
+
+    #[test]
+    fn ui_scale_is_clamped_to_what_mutter_can_use() {
+        assert_eq!(clamp_ui_scale(1.75), 1.75);
+        assert_eq!(clamp_ui_scale(0.1), 1.0);
+        assert_eq!(clamp_ui_scale(99.0), 3.0);
+        assert_eq!(clamp_ui_scale(f64::NAN), 1.5);
     }
 
     #[test]

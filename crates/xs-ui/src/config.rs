@@ -14,7 +14,7 @@ use xs_core::{BitrateBounds, DisplayMode};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Logical scale; the monitor is created panel_size/scale. 1.0 is native.
+    /// GNOME UI scale on the native-pixel virtual monitor. 1.0 is tiny text.
     pub scale: f64,
     /// `"extend"` or `"mirror"`.
     pub mode: String,

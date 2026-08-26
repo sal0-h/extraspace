@@ -79,6 +79,12 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     wire_controls(&widgets, &engine, &config);
     listen_to_engine(&widgets, &engine, &config);
 
+    let engine_on_close = engine.clone();
+    window.connect_close_request(move |_| {
+        engine_on_close.send(Command::Shutdown);
+        glib::Propagation::Proceed
+    });
+
     // Look for a tablet straight away; the user opened the app to use it.
     if config.borrow().auto_connect {
         engine.send(Command::Connect);
@@ -149,7 +155,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     let scale_refs: Vec<&str> = scale_labels.iter().map(String::as_str).collect();
     let scale_row = adw::ComboRow::builder()
         .title("Scale")
-        .subtitle("Larger scale means bigger text and less detail")
+        .subtitle("GNOME UI scale on native panel pixels")
         .model(&gtk::StringList::new(&scale_refs))
         .build();
     display_group.add(&scale_row);
@@ -327,15 +333,10 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
 }
 
 fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
-    // Show what the chosen scale actually produces. Without this, "1.5×" is an
-    // abstraction the user has to take on trust.
     let scale = config.borrow().scale;
-    // Sized against the reference 2000x1200 panel until a tablet reports its own,
-    // which is enough to make the trade-off concrete before connecting.
-    let (w, h) = xs_core::virtual_size_for(2000, 1200, scale);
-    widgets
-        .scale_row
-        .set_subtitle(&format!("{w} × {h} — larger scale means bigger text"));
+    widgets.scale_row.set_subtitle(&format!(
+        "{scale}× — how big the desktop looks, not how many pixels are sent"
+    ));
 }
 
 fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCell<Config>>) {
@@ -360,7 +361,7 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
     });
 }
 
-fn apply_state(widgets: &Rc<Widgets>, state: &State, _config: &Rc<RefCell<Config>>) {
+fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>>) {
     let show_status = |icon: &str, title: &str, description: &str, button: Option<&str>| {
         widgets.status.set_icon_name(Some(icon));
         widgets.status.set_title(title);
@@ -435,9 +436,12 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, _config: &Rc<RefCell<Config
         } => {
             widgets.window_title.set_subtitle(device);
             widgets.spinner.stop();
-            widgets
-                .stat_resolution
-                .set_subtitle(&format!("{width} × {height}"));
+            let scale = xs_core::clamp_ui_scale(config.borrow().scale);
+            let logical = xs_core::logical_size_for(*width, *height, scale);
+            widgets.stat_resolution.set_subtitle(&format!(
+                "{width} × {height} native — {}× UI ({} × {})",
+                scale, logical.0, logical.1
+            ));
             widgets.stat_encoder.set_subtitle(encoder);
             widgets.stack.set_visible_child_name("running");
         }

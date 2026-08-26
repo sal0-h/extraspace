@@ -24,10 +24,13 @@ use tracing::{debug, info, warn};
 use zbus::Connection;
 use zvariant::{OwnedObjectPath, Value};
 
+mod display;
 pub mod keys;
+mod patched;
 mod proxies;
 
 pub use keys::Chord;
+pub use patched::scaled_modes_allowed;
 pub use proxies::CursorMode;
 use proxies::{
     RemoteDesktopProxy, RemoteDesktopSessionProxy, ScreenCastProxy, ScreenCastSessionProxy,
@@ -63,7 +66,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Bit 2 of `RemoteDesktop.SupportedDeviceTypes`.
 const DEVICE_TYPE_TOUCHSCREEN: u32 = 4;
 
-/// `RecordVirtual` with pinned `modes` requires ScreenCast API v3+; we saw v4.
+/// `RecordVirtual` exists from ScreenCast API v3+; we saw v4.
 const REQUIRED_SCREENCAST_VERSION: i32 = 3;
 
 /// What the tablet should show.
@@ -80,8 +83,14 @@ pub struct DisplayConfig {
     pub width: u32,
     pub height: u32,
     pub refresh_rate: f64,
+    /// GNOME logical scale, passed as the mode's `preferred-scale`.
+    pub scale: f64,
     pub cursor_mode: CursorMode,
     pub source: CaptureSource,
+    /// Extra sizes to advertise as non-preferred modes. A saved `monitors.xml`
+    /// layout that pins a Meta-0 mode we no longer offer leaves the CRTC
+    /// unconfigured, and `get_specs` then dereferences it -- see [`Session::open`].
+    pub fallback_sizes: Vec<(u32, u32)>,
 }
 
 impl Default for DisplayConfig {
@@ -90,10 +99,41 @@ impl Default for DisplayConfig {
             width: 1920,
             height: 1080,
             refresh_rate: 60.0,
+            scale: 1.0,
             cursor_mode: CursorMode::Embedded,
             source: CaptureSource::Virtual,
+            fallback_sizes: Vec::new(),
         }
     }
+}
+
+/// Modes for `RecordVirtual`, preferred one first.
+///
+/// mutter 50.4 wants `size` as `(uu)`, an optional `refresh-rate` and
+/// `preferred-scale` as doubles, and exactly one mode with `is-preferred`.
+/// Anything else is rejected as *"Invalid modes passed"*.
+fn record_virtual_modes(config: &DisplayConfig) -> Vec<HashMap<&'static str, Value<'static>>> {
+    let mode = |w: u32, h: u32, preferred: bool, scale: Option<f64>| {
+        let mut m: HashMap<&'static str, Value<'static>> = HashMap::new();
+        m.insert("size", Value::from(zvariant::Structure::from((w, h))));
+        m.insert("refresh-rate", Value::from(config.refresh_rate));
+        if preferred {
+            m.insert("is-preferred", Value::from(true));
+        }
+        if let Some(scale) = scale {
+            m.insert("preferred-scale", Value::from(scale));
+        }
+        m
+    };
+
+    let mut modes = vec![mode(config.width, config.height, true, Some(config.scale))];
+    for &(w, h) in &config.fallback_sizes {
+        if w == 0 || h == 0 || (w == config.width && h == config.height) {
+            continue;
+        }
+        modes.push(mode(w, h, false, None));
+    }
+    modes
 }
 
 /// A live virtual monitor plus its input channel.
@@ -110,6 +150,8 @@ pub struct Session {
     /// PipeWire node id of the screen-cast stream.
     node_id: u32,
     config: DisplayConfig,
+    width: u32,
+    height: u32,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
     // the touch task and the teardown path both need it, and neither can take
     // ownership.
@@ -119,6 +161,9 @@ pub struct Session {
 impl Session {
     /// Runs the full setup and returns once the PipeWire node exists.
     pub async fn open(config: DisplayConfig) -> Result<Self> {
+        if matches!(config.source, CaptureSource::Virtual) {
+            display::purge_saved_virtual_layouts();
+        }
         let conn = Connection::session().await?;
 
         let remote_desktop = RemoteDesktopProxy::new(&conn)
@@ -161,23 +206,37 @@ impl Session {
         let sc_session = ScreenCastSessionProxy::new(&conn, sc_path.clone()).await?;
 
         // 3. Create the stream -- virtual monitor, or a mirror of a real one.
+        //
+        // `modes` is off by default because mutter 50.4 crashes both ways.
+        //
+        // Passing it sets `mode_infos`, and `get_specs` then reads the virtual
+        // CRTC's *assigned* config with no NULL check -- if the reload inside
+        // stream-src init has not configured it yet, gnome-shell SIGSEGVs during
+        // `Start` and the user is logged out. Measured on 50.4: survives
+        // sometimes, kills the session other times, same mode list.
+        //
+        // Leaving it out means `mode_infos` is NULL, so mutter sizes the monitor
+        // from PipeWire instead -- and `notify_params_updated` can then reload
+        // monitors from inside the format callback, which has its own NULL deref.
+        // That one only fires on a *second* format update, so we make sure there
+        // is never one: the size is pinned on EnumFormat and params are never
+        // updated mid-stream.
+        //
+        // `preferred-scale`, and with it a native-resolution HiDPI monitor, is
+        // only reachable through `modes`, so it needs a libmutter carrying the
+        // NULL checks; see [`scaled_modes_allowed`].
+        let use_modes = scaled_modes_allowed();
         let stream_path = match &config.source {
             CaptureSource::Virtual => {
-                let mode: HashMap<&str, Value<'_>> = HashMap::from([
-                    ("size", Value::from((config.width, config.height))),
-                    ("refresh-rate", Value::from(config.refresh_rate)),
-                    ("is-preferred", Value::from(true)),
-                ]);
-                let props: HashMap<&str, Value<'_>> = HashMap::from([
+                let mut props: HashMap<&str, Value<'_>> = HashMap::from([
                     // Behave as a real platform monitor: shows up in Settings ->
                     // Displays, can be arranged, holds workspaces.
                     ("is-platform", Value::from(true)),
                     ("cursor-mode", Value::from(config.cursor_mode as u32)),
-                    // Pinning modes stops PipeWire renegotiating us to some other
-                    // resolution. Requires GNOME 50+; harmless to send to older
-                    // mutter, which ignores unknown keys.
-                    ("modes", Value::from(vec![mode])),
                 ]);
+                if use_modes {
+                    props.insert("modes", Value::from(record_virtual_modes(&config)));
+                }
                 sc_session.record_virtual(props).await?
             }
             CaptureSource::Monitor(connector) => {
@@ -202,10 +261,29 @@ impl Session {
             }
         };
 
+        // What mutter actually configured. A saved layout can pin an older mode,
+        // and the stream carries that size, not the one we asked for -- so read
+        // it back rather than negotiating a format the node will never produce.
+        let effective = match config.source {
+            CaptureSource::Virtual => display::virtual_monitor_state(&conn).await,
+            CaptureSource::Monitor(_) => None,
+        };
+        let (width, height) = effective
+            .map(|s| (s.width, s.height))
+            .unwrap_or((config.width, config.height));
+        if (width, height) != (config.width, config.height) {
+            warn!(
+                asked = format!("{}x{}", config.width, config.height),
+                got = format!("{width}x{height}"),
+                "mutter kept a saved Meta-0 mode; streaming that instead"
+            );
+        }
+
         info!(
             node_id,
-            width = config.width,
-            height = config.height,
+            width,
+            height,
+            scale = effective.map(|s| s.scale).unwrap_or(config.scale),
             source = ?config.source,
             "virtual monitor is live"
         );
@@ -217,8 +295,15 @@ impl Session {
             stream_path: stream_path.as_str().to_owned(),
             node_id,
             config,
+            width,
+            height,
             stopped: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Size mutter really gave us, which is what the stream will carry.
+    pub fn effective_size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// PipeWire node id of the screen-cast stream.
@@ -370,67 +455,6 @@ impl InputOnlySession {
 ///
 /// Used to populate the mirror-source picker.
 pub async fn list_monitors() -> Result<Vec<String>> {
-    use zvariant::OwnedValue;
-
     let conn = Connection::session().await?;
-    let reply = conn
-        .call_method(
-            Some("org.gnome.Mutter.DisplayConfig"),
-            "/org/gnome/Mutter/DisplayConfig",
-            Some("org.gnome.Mutter.DisplayConfig"),
-            "GetCurrentState",
-            &(),
-        )
-        .await?;
-
-    // GetCurrentState returns:
-    //   u                            serial
-    //   a((ssss)a(siiddada{sv})a{sv})  monitors
-    //   a(iiduba(ssss)a{sv})           logical monitors
-    //   a{sv}                          properties
-    //
-    // Each monitor's first field is (connector, vendor, product, serial); the
-    // connector is all we need. The nested mode struct must still be spelled out
-    // correctly or the whole deserialize fails.
-    type MonitorSpec = (String, String, String, String);
-    type Mode = (
-        String,                      // mode id
-        i32,                         // width
-        i32,                         // height
-        f64,                         // refresh rate
-        f64,                         // preferred scale
-        Vec<f64>,                    // supported scales
-        HashMap<String, OwnedValue>, // properties
-    );
-    type Monitor = (MonitorSpec, Vec<Mode>, HashMap<String, OwnedValue>);
-    type LogicalMonitor = (
-        i32,
-        i32,
-        f64,
-        u32,
-        bool,
-        Vec<MonitorSpec>,
-        HashMap<String, OwnedValue>,
-    );
-
-    let body = reply.body();
-    let (_serial, monitors, _logical, _props): (
-        u32,
-        Vec<Monitor>,
-        Vec<LogicalMonitor>,
-        HashMap<String, OwnedValue>,
-    ) = match body.deserialize() {
-        Ok(v) => v,
-        Err(e) => {
-            // Not worth failing the whole app over: this only feeds the
-            // mirror-source picker, and mutter's reply shape has changed before.
-            warn!(error = %e, "could not parse DisplayConfig.GetCurrentState; mirror sources unavailable");
-            return Ok(Vec::new());
-        }
-    };
-
-    Ok(monitors
-        .into_iter()
-        .map(|((connector, ..), ..)| connector)
-        .collect())
+    Ok(display::list_connectors_best_effort(&conn).await)
 }

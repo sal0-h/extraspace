@@ -25,15 +25,21 @@ async fn main() -> anyhow::Result<()> {
 
     println!("monitors before: {:?}", xs_mutter::list_monitors().await?);
 
+    // Scale only reaches mutter with XS_MUTTER_MODES=1, which can log you out on
+    // an unpatched 50.4. 2296x1428 rather than the 2304x1440 panel because 1.75x
+    // has to divide into whole logical pixels.
     let session = Session::open(DisplayConfig {
-        width: 2000,
-        height: 1200,
+        width: 2296,
+        height: 1428,
         refresh_rate: 60.0,
+        scale: 1.75,
         cursor_mode: CursorMode::Embedded,
         source: CaptureSource::Virtual,
+        fallback_sizes: vec![(2304, 1440), (1316, 822), (1152, 720), (1536, 960)],
     })
     .await?;
 
+    println!("\n  effective size   : {:?}", session.effective_size());
     println!("\n  pipewire node id : {}", session.node_id());
     println!(
         "  consume it with  : gst-launch-1.0 pipewiresrc path={} ! videoconvert ! autovideosink\n",

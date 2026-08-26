@@ -102,6 +102,7 @@ Categories=Utility;GTK;GNOME;
 Keywords=display;monitor;tablet;android;screen;webcam;camera;second screen;
 StartupNotify=true
 StartupWMClass=$BIN_NAME
+X-GNOME-Autostart-enabled=false
 EOF
 ok "installed desktop entry"
 
