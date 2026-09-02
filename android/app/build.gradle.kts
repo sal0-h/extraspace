@@ -11,7 +11,7 @@ android {
         applicationId = "io.github.tymonoman.extraspace"
         // The host refuses to talk to a mismatched app, so this is the number it
         // compares against when deciding whether to push a new APK.
-        versionCode = 7
+        versionCode = 8
         versionName = "0.1.0"
         // MediaFormat.KEY_LOW_LATENCY needs 30; below that the decoder buffers
         // several frames and the whole latency budget is gone.

@@ -52,6 +52,15 @@ class VideoDecoder(private val surface: Surface) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1)
             }
+            // The host converts desktop sRGB to full-range BT.709 YUV. The VA
+            // encoder writes no VUI, so without these keys MediaCodec assumes
+            // limited range (16-235). TextureView is then composited as
+            // V0_SRGB / full range, and the picture goes washed-out. Pinning
+            // full range here stops the decoder from expanding values that are
+            // already 0-255.
+            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
+            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
             // SPS/PPS, if the host sent them ahead of the first frame. The host
             // also repeats them inline on every keyframe, so this is belt and
             // braces for the very first connection.

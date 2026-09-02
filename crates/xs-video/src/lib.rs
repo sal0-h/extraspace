@@ -53,6 +53,22 @@ pub type PaceWindow = (u64, u64, u64);
 /// frame has no value, and a deeper queue is how a short stall becomes a hitch.
 const FRAME_QUEUE_DEPTH: usize = 1;
 
+/// Desktop RGB is full-range sRGB. Named so the converter does not have to guess.
+const RGB_COLORIMETRY: &str = "sRGB";
+
+/// BT.709 primaries, matrix and transfer, full (0–255) range.
+///
+/// `vapostproc` defaults to limited-range NV12 — black encodes as Y=16, white as
+/// Y=235 — and `vah264lpenc` writes no VUI to say so. The tablet's TextureView
+/// is composited by SurfaceFlinger as `V0_SRGB` (full range), so those frames
+/// render washed-out: grey blacks, dull whites. Replugging rebuilds the decoder
+/// and sometimes the first path expands the range; after MediaCodec idles it
+/// often does not. Pinning full-range conversion makes the pixels match how the
+/// tablet actually displays them.
+///
+/// GStreamer serialises this as `primaries:matrix:transfer:range` = `1:3:5:1`.
+const YUV_COLORIMETRY: &str = "1:3:5:1";
+
 /// Isolation stages for native-resolution budget work. Unset = production path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PipelineKind {
@@ -290,6 +306,7 @@ impl VideoPipeline {
             .field("width", config.width as i32)
             .field("height", config.height as i32)
             .field("framerate", gst::Fraction::new(config.framerate as i32, 1))
+            .field("colorimetry", RGB_COLORIMETRY)
             .build();
         let overlay_src = AppSrc::builder()
             .name("cursor-overlay")
@@ -329,6 +346,7 @@ impl VideoPipeline {
                             gst::Caps::builder("video/x-raw")
                                 .features(["memory:VAMemory"])
                                 .field("format", "NV12")
+                                .field("colorimetry", YUV_COLORIMETRY)
                                 .build(),
                         )?,
                     )
@@ -338,6 +356,7 @@ impl VideoPipeline {
                         caps_filter(
                             gst::Caps::builder("video/x-raw")
                                 .field("format", "I420")
+                                .field("colorimetry", YUV_COLORIMETRY)
                                 .build(),
                         )?,
                     )
@@ -441,6 +460,7 @@ impl VideoPipeline {
                     let convert_caps = caps_filter(
                         gst::Caps::builder("video/x-raw")
                             .field("format", "I420")
+                            .field("colorimetry", YUV_COLORIMETRY)
                             .build(),
                     )?;
                     let elems = [

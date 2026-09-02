@@ -327,6 +327,7 @@ impl CursorHub {
                 .field("width", width as i32)
                 .field("height", height as i32)
                 .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
+                .field("colorimetry", "sRGB")
                 .build();
             if let Some(appsrc) = self.appsrc.lock().expect("cursor appsrc lock").clone() {
                 appsrc.set_caps(Some(&caps));
@@ -344,6 +345,7 @@ impl CursorHub {
             .field("width", width as i32)
             .field("height", height as i32)
             .field("framerate", gst::Fraction::new(self.framerate as i32, 1))
+            .field("colorimetry", "sRGB")
             .build();
         appsrc.set_caps(Some(&caps));
     }
