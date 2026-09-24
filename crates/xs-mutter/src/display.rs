@@ -54,7 +54,7 @@ type AppliedLogicalMonitor = (
 const APPLY_TEMPORARY: u32 = 1;
 const LAYOUT_LOGICAL: u32 = 1;
 const VIRTUAL_WAIT: Duration = Duration::from_millis(50);
-const VIRTUAL_WAIT_TRIES: u32 = 20;
+const VIRTUAL_WAIT_TRIES: u32 = 100;
 
 /// The monitor configuration before RecordVirtual changes the monitor set.
 /// Mutter may choose a fresh layout as soon as the virtual output appears, so

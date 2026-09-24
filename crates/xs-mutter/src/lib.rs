@@ -156,6 +156,10 @@ pub struct Session {
     config: DisplayConfig,
     width: u32,
     height: u32,
+    // Without RecordVirtual modes, mutter creates the output only when a
+    // PipeWire consumer negotiates its format. Keep the preconnection layout
+    // until that consumer has started.
+    pending_layout: Option<display::DisplayLayout>,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
     // the touch task and the teardown path both need it, and neither can take
     // ownership.
@@ -173,7 +177,7 @@ impl Session {
         // Mutter may replace the entire physical monitor layout when the new
         // virtual output joins it. Keep the user's current layout before
         // RecordVirtual so the later ApplyMonitorsConfig cannot copy that reset.
-        let original_layout = if matches!(config.source, CaptureSource::Virtual)
+        let mut original_layout = if matches!(config.source, CaptureSource::Virtual)
             && patched::patched_mutter_is_running()
         {
             Some(display::capture_display_layout(&conn).await?)
@@ -276,12 +280,16 @@ impl Session {
             }
         };
 
-        // Add the tablet to the layout captured before mutter reconfigured the
-        // existing monitors. A fresh virtual serial may also be left disabled.
-        if let Some(before) = original_layout.as_ref() {
-            if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, before).await {
-                let _ = rd_session.stop().await;
-                return Err(e);
+        // With explicit modes, mutter has already created Meta-0. Without
+        // modes it waits for a PipeWire consumer, so that path is finalized
+        // after the video pipeline starts.
+        if use_modes {
+            if let Some(before) = original_layout.take() {
+                if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, &before).await
+                {
+                    let _ = rd_session.stop().await;
+                    return Err(e);
+                }
             }
         }
 
@@ -289,8 +297,9 @@ impl Session {
         // and the stream carries that size, not the one we asked for -- so read
         // it back rather than negotiating a format the node will never produce.
         let effective = match config.source {
-            CaptureSource::Virtual => display::virtual_monitor_state(&conn).await,
+            CaptureSource::Virtual if use_modes => display::virtual_monitor_state(&conn).await,
             CaptureSource::Monitor(_) => None,
+            CaptureSource::Virtual => None,
         };
         let (width, height) = effective
             .map(|s| (s.width, s.height))
@@ -321,8 +330,20 @@ impl Session {
             config,
             width,
             height,
+            pending_layout: original_layout,
             stopped: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Complete layout setup after the video pipeline connects to PipeWire.
+    /// In the mode-less path, that connection is what creates Meta-0.
+    pub async fn finalize_display_layout(&self) -> Result<()> {
+        if let Some(before) = &self.pending_layout {
+            // The mode-less path has already divided the framebuffer by the
+            // requested UI scale. Its GNOME monitor scale stays at 1.0.
+            display::enable_virtual_monitor(&self._conn, 1.0, before).await?;
+        }
+        Ok(())
     }
 
     /// Size mutter really gave us, which is what the stream will carry.

@@ -428,6 +428,7 @@ async fn connect(
     )?;
     let encoder_name = pipeline.encoder().human_name().to_string();
     pipeline.start()?;
+    mutter.finalize_display_layout().await?;
     let pipeline = Arc::new(pipeline);
 
     // Tell the tablet what is coming before the first frame arrives.
