@@ -57,6 +57,9 @@ pub enum Error {
     #[error("PipeWire stream negotiation timed out after {}s -- mutter never emitted PipeWireStreamAdded", NEGOTIATION_TIMEOUT.as_secs())]
     NegotiationTimeout,
 
+    #[error("could not preserve the monitor layout: {0}")]
+    DisplayLayout(String),
+
     #[error("mutter reports no touchscreen support (SupportedDeviceTypes = {0:#b})")]
     NoTouchSupport(u32),
 }
@@ -167,6 +170,17 @@ impl Session {
         }
         let conn = Connection::session().await?;
 
+        // Mutter may replace the entire physical monitor layout when the new
+        // virtual output joins it. Keep the user's current layout before
+        // RecordVirtual so the later ApplyMonitorsConfig cannot copy that reset.
+        let original_layout = if matches!(config.source, CaptureSource::Virtual)
+            && patched::patched_mutter_is_running()
+        {
+            Some(display::capture_display_layout(&conn).await?)
+        } else {
+            None
+        };
+
         let remote_desktop = RemoteDesktopProxy::new(&conn)
             .await
             .map_err(|_| Error::NoMutter)?;
@@ -262,15 +276,12 @@ impl Session {
             }
         };
 
-        // mutter creates a virtual output with a fresh serial every session, so it
-        // never matches a saved layout and GNOME leaves it disabled. Turn it on
-        // beside the primary display once the PipeWire node exists.
-        if matches!(config.source, CaptureSource::Virtual) {
-            if let Err(e) = display::enable_virtual_monitor(&conn, config.scale).await {
-                warn!(
-                    error = %e,
-                    "could not turn the virtual monitor on; enable it in Settings → Displays"
-                );
+        // Add the tablet to the layout captured before mutter reconfigured the
+        // existing monitors. A fresh virtual serial may also be left disabled.
+        if let Some(before) = original_layout.as_ref() {
+            if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, before).await {
+                let _ = rd_session.stop().await;
+                return Err(e);
             }
         }
 

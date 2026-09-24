@@ -3,9 +3,9 @@
 //! `ApplyMonitorsConfig` used to race PipeWire format negotiation on stock
 //! mutter 50.4 and SIGSEGV gnome-shell. The local libmutter rebuild guards those
 //! NULL paths, so after the PipeWire node exists we can ask mutter to put the
-//! new Meta-0 into the layout. Without that, a virtual serial that does not
-//! match `monitors.xml` is created disabled and the user has to enable it in
-//! Settings → Displays.
+//! new Meta-0 into the layout. A new virtual serial can also make mutter pick a
+//! fresh layout that resets existing monitor transforms. Preserve the layout
+//! from before RecordVirtual in either case.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -14,7 +14,6 @@ use tracing::{info, warn};
 use zbus::Connection;
 use zvariant::{OwnedValue, Value};
 
-use crate::patched::patched_mutter_is_running;
 use crate::{Error, Result};
 
 type MonitorSpec = (String, String, String, String);
@@ -43,11 +42,37 @@ type CurrentState = (
     Vec<LogicalMonitor>,
     HashMap<String, OwnedValue>,
 );
+type AppliedLogicalMonitor = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<(String, String, HashMap<String, Value<'static>>)>,
+);
 
 const APPLY_TEMPORARY: u32 = 1;
 const LAYOUT_LOGICAL: u32 = 1;
 const VIRTUAL_WAIT: Duration = Duration::from_millis(50);
 const VIRTUAL_WAIT_TRIES: u32 = 20;
+
+/// The monitor configuration before RecordVirtual changes the monitor set.
+/// Mutter may choose a fresh layout as soon as the virtual output appears, so
+/// its state at that point is not a reliable source for the existing displays.
+pub(crate) struct DisplayLayout {
+    monitors: Vec<Monitor>,
+    logical: Vec<LogicalMonitor>,
+    properties: HashMap<String, OwnedValue>,
+}
+
+pub(crate) async fn capture_display_layout(conn: &Connection) -> Result<DisplayLayout> {
+    let (_serial, monitors, logical, properties) = get_current_state(conn).await?;
+    Ok(DisplayLayout {
+        monitors,
+        logical,
+        properties,
+    })
+}
 
 /// Connector names mutter currently knows about (e.g. `["DP-3", "HDMI-1"]`).
 pub async fn list_connectors(conn: &Connection) -> Result<Vec<String>> {
@@ -88,100 +113,77 @@ pub async fn virtual_monitor_state(conn: &Connection) -> Option<VirtualState> {
     })
 }
 
-/// If the virtual monitor exists but is not in the layout, turn it on to the
-/// right of the primary display.
+/// Add the virtual monitor to the layout that existed before RecordVirtual.
 ///
-/// Skipped on stock mutter: applying a layout races the screen-cast source and
-/// used to log the user out. After a successful apply, Settings → Displays
-/// shows the tablet as an ordinary monitor.
-pub async fn enable_virtual_monitor(conn: &Connection, wanted_scale: f64) -> Result<()> {
-    if !patched_mutter_is_running() {
-        return Ok(());
-    }
-
+/// Mutter can regenerate the whole configuration when a new output appears,
+/// including the transforms of existing monitors. Reading the layout only after
+/// that reload would preserve the wrong orientation. This runs only with the
+/// patched mutter: ApplyMonitorsConfig races screen-cast setup on stock 50.4.
+pub(crate) async fn enable_virtual_monitor(
+    conn: &Connection,
+    wanted_scale: f64,
+    before: &DisplayLayout,
+) -> Result<()> {
     let mut state = None;
     for _ in 0..VIRTUAL_WAIT_TRIES {
         let candidate = get_current_state(conn).await?;
-        if candidate.1.iter().any(|(spec, ..)| is_virtual(spec)) {
+        if new_virtual_monitor(&candidate.1, before).is_some() {
             state = Some(candidate);
             break;
         }
         tokio::time::sleep(VIRTUAL_WAIT).await;
     }
     let Some((serial, monitors, logical, properties)) = state else {
-        warn!("virtual monitor never appeared in DisplayConfig; leaving layout alone");
-        return Ok(());
+        return Err(Error::DisplayLayout(
+            "the new virtual monitor did not appear in DisplayConfig".into(),
+        ));
     };
 
-    let Some((spec, modes, mon_props)) = monitors.iter().find(|(spec, ..)| is_virtual(spec)) else {
-        return Ok(());
-    };
-    if logical
-        .iter()
-        .any(|(.., specs, _)| specs.iter().any(|s| s.0 == spec.0))
+    let (spec, modes, mon_props) = new_virtual_monitor(&monitors, before)
+        .ok_or_else(|| Error::DisplayLayout("the new virtual monitor disappeared".into()))?;
+    if monitors.len() != before.monitors.len() + 1
+        || !before
+            .monitors
+            .iter()
+            .all(|(old_spec, ..)| monitors.iter().any(|(now_spec, ..)| now_spec == old_spec))
     {
-        return Ok(());
+        return Err(Error::DisplayLayout(
+            "the connected monitors changed while starting the stream".into(),
+        ));
     }
 
-    let Some(preferred) = modes
+    let virtual_active = logical
+        .iter()
+        .any(|(.., specs, _)| specs.iter().any(|s| s == spec));
+    let existing_layout_unchanged =
+        existing_layout_matches(before, &monitors, &logical, &properties, spec);
+    if virtual_active && existing_layout_unchanged {
+        return Ok(());
+    }
+    if !existing_layout_unchanged {
+        warn!("mutter changed the existing monitor layout while adding the virtual monitor; restoring it");
+    }
+
+    let preferred = modes
         .iter()
         .find(|mode| mode_flag(mode, "is-preferred"))
         .or_else(|| modes.first())
-    else {
-        warn!("virtual monitor has no modes; cannot enable it");
-        return Ok(());
-    };
+        .ok_or_else(|| Error::DisplayLayout("the virtual monitor has no modes".into()))?;
 
     let virtual_mode = preferred.0.clone();
     let virtual_scale = closest_scale(preferred, wanted_scale);
     let (virt_w, virt_h) = (preferred.1, preferred.2);
 
-    let layout_mode = prop_u32(&properties, "layout-mode").unwrap_or(LAYOUT_LOGICAL);
-    let (x, y) = place_right_of_primary(&monitors, &logical, layout_mode);
-
-    let mut applied: Vec<(
-        i32,
-        i32,
-        f64,
-        u32,
-        bool,
-        Vec<(String, String, HashMap<String, Value<'static>>)>,
-    )> = Vec::new();
-
-    for (lx, ly, scale, transform, primary, specs, _props) in &logical {
-        let mut members = Vec::new();
-        for spec in specs {
-            let Some((_, modes, props)) = monitors.iter().find(|(s, ..)| s.0 == spec.0) else {
-                continue;
-            };
-            let mode = modes
-                .iter()
-                .find(|m| mode_flag(m, "is-current"))
-                .or_else(|| modes.iter().find(|m| mode_flag(m, "is-preferred")))
-                .or_else(|| modes.first());
-            let Some(mode) = mode else {
-                continue;
-            };
-            members.push((spec.0.clone(), mode.0.clone(), monitor_apply_props(props)));
-        }
-        if members.is_empty() {
-            continue;
-        }
-        applied.push((*lx, *ly, *scale, *transform, *primary, members));
-    }
-
-    applied.push((
-        x,
-        y,
+    let layout_mode = prop_u32(&before.properties, "layout-mode").unwrap_or(LAYOUT_LOGICAL);
+    let (applied, x, y) = build_applied_layout(
+        before,
+        &monitors,
+        spec,
+        mon_props,
+        &virtual_mode,
         virtual_scale,
-        0,
-        false,
-        vec![(
-            spec.0.clone(),
-            virtual_mode.clone(),
-            monitor_apply_props(mon_props),
-        )],
-    ));
+        layout_mode,
+    )?;
 
     let mut apply_props: HashMap<String, Value<'static>> = HashMap::new();
     if prop_bool(&properties, "supports-changing-layout-mode") {
@@ -210,6 +212,64 @@ pub async fn enable_virtual_monitor(conn: &Connection, wanted_scale: f64) -> Res
     Ok(())
 }
 
+fn build_applied_layout(
+    before: &DisplayLayout,
+    monitors: &[Monitor],
+    virtual_spec: &MonitorSpec,
+    virtual_props: &HashMap<String, OwnedValue>,
+    virtual_mode: &str,
+    virtual_scale: f64,
+    layout_mode: u32,
+) -> Result<(Vec<AppliedLogicalMonitor>, i32, i32)> {
+    let (x, y) = place_after_layout(&before.monitors, &before.logical, layout_mode);
+    let mut applied = Vec::with_capacity(before.logical.len() + 1);
+
+    for (lx, ly, scale, transform, primary, specs, _props) in &before.logical {
+        let mut members = Vec::new();
+        for spec in specs {
+            let old_monitor = before
+                .monitors
+                .iter()
+                .find(|(s, ..)| s == spec)
+                .ok_or_else(|| {
+                    Error::DisplayLayout(format!("{} vanished from the saved layout", spec.0))
+                })?;
+            let mode_id = current_mode_id(old_monitor)
+                .ok_or_else(|| Error::DisplayLayout(format!("{} had no active mode", spec.0)))?;
+            let now_monitor = monitors
+                .iter()
+                .find(|(s, ..)| s == spec)
+                .ok_or_else(|| Error::DisplayLayout(format!("{} disconnected", spec.0)))?;
+            if !now_monitor.1.iter().any(|mode| mode.0 == mode_id) {
+                return Err(Error::DisplayLayout(format!(
+                    "{} no longer offers mode {mode_id}",
+                    spec.0
+                )));
+            }
+            members.push((
+                spec.0.clone(),
+                mode_id.to_owned(),
+                monitor_apply_props(&old_monitor.2),
+            ));
+        }
+        applied.push((*lx, *ly, *scale, *transform, *primary, members));
+    }
+
+    applied.push((
+        x,
+        y,
+        virtual_scale,
+        0,
+        !before.logical.iter().any(|(.., primary, _, _)| *primary),
+        vec![(
+            virtual_spec.0.clone(),
+            virtual_mode.to_owned(),
+            monitor_apply_props(virtual_props),
+        )],
+    ));
+    Ok((applied, x, y))
+}
+
 async fn get_current_state(conn: &Connection) -> Result<CurrentState> {
     let reply = conn
         .call_method(
@@ -224,6 +284,67 @@ async fn get_current_state(conn: &Connection) -> Result<CurrentState> {
         Error::DBus(zbus::Error::Failure(format!(
             "GetCurrentState deserialize: {e}"
         )))
+    })
+}
+
+fn new_virtual_monitor<'a>(monitors: &'a [Monitor], before: &DisplayLayout) -> Option<&'a Monitor> {
+    monitors.iter().find(|(spec, ..)| {
+        is_virtual(spec)
+            && !before
+                .monitors
+                .iter()
+                .any(|(old_spec, ..)| old_spec == spec)
+    })
+}
+
+fn current_mode_id(monitor: &Monitor) -> Option<&str> {
+    monitor
+        .1
+        .iter()
+        .find(|mode| mode_flag(mode, "is-current"))
+        .map(|mode| mode.0.as_str())
+}
+
+fn same_specs(a: &[MonitorSpec], b: &[MonitorSpec]) -> bool {
+    a.len() == b.len() && a.iter().all(|spec| b.contains(spec))
+}
+
+fn existing_layout_matches(
+    before: &DisplayLayout,
+    monitors: &[Monitor],
+    logical: &[LogicalMonitor],
+    properties: &HashMap<String, OwnedValue>,
+    new_spec: &MonitorSpec,
+) -> bool {
+    if prop_u32(&before.properties, "layout-mode") != prop_u32(properties, "layout-mode") {
+        return false;
+    }
+
+    let existing_logical: Vec<_> = logical
+        .iter()
+        .filter(|(.., specs, _)| !specs.contains(new_spec))
+        .collect();
+    if existing_logical.len() != before.logical.len() {
+        return false;
+    }
+
+    before.logical.iter().all(|old| {
+        existing_logical.iter().any(|now| {
+            old.0 == now.0
+                && old.1 == now.1
+                && old.2 == now.2
+                && old.3 == now.3
+                && old.4 == now.4
+                && same_specs(&old.5, &now.5)
+        })
+    }) && before.monitors.iter().all(|old| {
+        monitors.iter().any(|now| {
+            old.0 == now.0
+                && current_mode_id(old) == current_mode_id(now)
+                && prop_u32(&old.2, "color-mode") == prop_u32(&now.2, "color-mode")
+                && prop_u32(&old.2, "rgb-range") == prop_u32(&now.2, "rgb-range")
+                && prop_bool(&old.2, "is-underscanning") == prop_bool(&now.2, "is-underscanning")
+        })
     })
 }
 
@@ -251,6 +372,12 @@ fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
 
 fn monitor_apply_props(props: &HashMap<String, OwnedValue>) -> HashMap<String, Value<'static>> {
     let mut out = HashMap::new();
+    if let Some(v) = props
+        .get("is-underscanning")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+    {
+        out.insert("underscanning".into(), Value::from(v));
+    }
     if let Some(v) = prop_u32(props, "color-mode") {
         out.insert("color-mode".into(), Value::from(v));
     }
@@ -313,22 +440,21 @@ fn current_mode_size(monitors: &[Monitor], connector: &str) -> Option<(i32, i32)
     Some((mode.1, mode.2))
 }
 
-fn place_right_of_primary(
+fn place_after_layout(
     monitors: &[Monitor],
     logical: &[LogicalMonitor],
     layout_mode: u32,
 ) -> (i32, i32) {
-    let primary = logical
+    logical
         .iter()
-        .find(|(.., primary, _, _)| *primary)
-        .or_else(|| logical.first());
-    let Some((x, y, scale, transform, _, specs, _)) = primary else {
-        return (0, 0);
-    };
-    let connector = specs.first().map(|s| s.0.as_str()).unwrap_or("");
-    let (mw, mh) = current_mode_size(monitors, connector).unwrap_or((0, 0));
-    let (lw, _) = logical_size(mw, mh, *scale, *transform, layout_mode);
-    (x + lw, *y)
+        .filter_map(|(x, y, scale, transform, _, specs, _)| {
+            let connector = specs.first()?.0.as_str();
+            let (mw, mh) = current_mode_size(monitors, connector)?;
+            let (lw, _) = logical_size(mw, mh, *scale, *transform, layout_mode);
+            Some((x + lw, *y))
+        })
+        .max_by_key(|(right, _)| *right)
+        .unwrap_or((0, 0))
 }
 
 /// Drops saved layouts that mention a virtual monitor, keeping a `.bak` once.
@@ -419,6 +545,39 @@ pub async fn list_connectors_best_effort(conn: &Connection) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn monitor_spec(connector: &str, vendor: &str) -> MonitorSpec {
+        (
+            connector.into(),
+            vendor.into(),
+            "model".into(),
+            "serial".into(),
+        )
+    }
+
+    fn active_monitor(spec: MonitorSpec, mode_id: &str, width: i32, height: i32) -> Monitor {
+        let mode_props = HashMap::from([
+            ("is-current".into(), OwnedValue::from(true)),
+            ("is-preferred".into(), OwnedValue::from(true)),
+        ]);
+        (
+            spec,
+            vec![(
+                mode_id.into(),
+                width,
+                height,
+                60.0,
+                1.0,
+                vec![1.0],
+                mode_props,
+            )],
+            HashMap::new(),
+        )
+    }
+
+    fn logical_monitor(x: i32, transform: u32, primary: bool, spec: MonitorSpec) -> LogicalMonitor {
+        (x, 0, 1.0, transform, primary, vec![spec], HashMap::new())
+    }
+
     #[test]
     fn ninety_degree_transform_swaps_logical_size() {
         assert_eq!(
@@ -444,5 +603,62 @@ mod tests {
         );
         assert!((closest_scale(&mode, 1.5) - 1.5).abs() < f64::EPSILON);
         assert!((closest_scale(&mode, 1.4) - 1.3333333730697632).abs() < 0.01);
+    }
+
+    #[test]
+    fn new_virtual_monitor_keeps_preexisting_monitor_layout() {
+        let laptop = monitor_spec("eDP-1", "CMN");
+        let external = monitor_spec("DP-1", "DEL");
+        let virtual_spec = monitor_spec("Meta-0", "MetaVendor");
+        let before = DisplayLayout {
+            monitors: vec![
+                active_monitor(laptop.clone(), "1920x1080", 1920, 1080),
+                active_monitor(external.clone(), "1920x1080", 1920, 1080),
+            ],
+            logical: vec![
+                logical_monitor(0, 2, true, laptop.clone()),
+                logical_monitor(1920, 1, false, external.clone()),
+            ],
+            properties: HashMap::from([("layout-mode".into(), OwnedValue::from(LAYOUT_LOGICAL))]),
+        };
+
+        // Mutter's fallback configuration can enable Meta-0 while resetting
+        // both physical transforms to normal. An already enabled virtual output
+        // must not make us accept that changed layout.
+        let monitors = vec![
+            active_monitor(laptop.clone(), "1920x1080", 1920, 1080),
+            active_monitor(external.clone(), "1920x1080", 1920, 1080),
+            active_monitor(virtual_spec.clone(), "1200x1920", 1200, 1920),
+        ];
+        let logical = vec![
+            logical_monitor(0, 0, true, laptop),
+            logical_monitor(1920, 0, false, external),
+            logical_monitor(3840, 0, false, virtual_spec.clone()),
+        ];
+        let properties = HashMap::from([("layout-mode".into(), OwnedValue::from(LAYOUT_LOGICAL))]);
+        assert!(!existing_layout_matches(
+            &before,
+            &monitors,
+            &logical,
+            &properties,
+            &virtual_spec,
+        ));
+
+        let (applied, x, y) = build_applied_layout(
+            &before,
+            &monitors,
+            &virtual_spec,
+            &HashMap::new(),
+            "1200x1920",
+            1.0,
+            LAYOUT_LOGICAL,
+        )
+        .unwrap();
+        assert_eq!((x, y), (3000, 0));
+        assert_eq!(applied.len(), 3);
+        assert_eq!(applied[0].3, 2);
+        assert_eq!(applied[1].3, 1);
+        assert_eq!(applied[0].5[0].1, "1920x1080");
+        assert_eq!(applied[2].5[0].0, "Meta-0");
     }
 }
