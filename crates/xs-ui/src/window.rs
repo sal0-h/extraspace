@@ -11,7 +11,7 @@
 //! authorised -- are entirely fixable by the user, so each gets its own page
 //! saying exactly which buttons to press.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -80,9 +80,18 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     listen_to_engine(&widgets, &engine, &config);
 
     let engine_on_close = engine.clone();
-    window.connect_close_request(move |_| {
-        engine_on_close.send(Command::Shutdown);
-        glib::Propagation::Proceed
+    let closing = Rc::new(Cell::new(false));
+    window.connect_close_request(move |window| {
+        if closing.replace(true) {
+            return glib::Propagation::Proceed;
+        }
+        let window = window.clone();
+        let engine = engine_on_close.clone();
+        glib::spawn_future_local(async move {
+            engine.shutdown().await;
+            window.close();
+        });
+        glib::Propagation::Stop
     });
 
     // Look for a tablet straight away; the user opened the app to use it.

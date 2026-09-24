@@ -156,10 +156,8 @@ pub struct Session {
     config: DisplayConfig,
     width: u32,
     height: u32,
-    // Without RecordVirtual modes, mutter creates the output only when a
-    // PipeWire consumer negotiates its format. Keep the preconnection layout
-    // until that consumer has started.
-    pending_layout: Option<display::DisplayLayout>,
+    layout_before: Option<display::DisplayLayout>,
+    use_modes: bool,
     // Atomic rather than a bool so the session can be shared behind an `Arc` --
     // the touch task and the teardown path both need it, and neither can take
     // ownership.
@@ -177,7 +175,7 @@ impl Session {
         // Mutter may replace the entire physical monitor layout when the new
         // virtual output joins it. Keep the user's current layout before
         // RecordVirtual so the later ApplyMonitorsConfig cannot copy that reset.
-        let mut original_layout = if matches!(config.source, CaptureSource::Virtual)
+        let original_layout = if matches!(config.source, CaptureSource::Virtual)
             && patched::patched_mutter_is_running()
         {
             Some(display::capture_display_layout(&conn).await?)
@@ -284,9 +282,8 @@ impl Session {
         // modes it waits for a PipeWire consumer, so that path is finalized
         // after the video pipeline starts.
         if use_modes {
-            if let Some(before) = original_layout.take() {
-                if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, &before).await
-                {
+            if let Some(before) = original_layout.as_ref() {
+                if let Err(e) = display::enable_virtual_monitor(&conn, config.scale, before).await {
                     let _ = rd_session.stop().await;
                     return Err(e);
                 }
@@ -330,7 +327,8 @@ impl Session {
             config,
             width,
             height,
-            pending_layout: original_layout,
+            layout_before: original_layout,
+            use_modes,
             stopped: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -338,7 +336,10 @@ impl Session {
     /// Complete layout setup after the video pipeline connects to PipeWire.
     /// In the mode-less path, that connection is what creates Meta-0.
     pub async fn finalize_display_layout(&self) -> Result<()> {
-        if let Some(before) = &self.pending_layout {
+        if !self.use_modes {
+            let Some(before) = &self.layout_before else {
+                return Ok(());
+            };
             // The mode-less path has already divided the framebuffer by the
             // requested UI scale. Its GNOME monitor scale stays at 1.0.
             display::enable_virtual_monitor(&self._conn, 1.0, before).await?;
@@ -369,11 +370,27 @@ impl Session {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // Capture the physical displays immediately before removing Meta-0.
+        // The user may have changed orientation or arrangement while connected.
+        let restore = if let Some(before) = &self.layout_before {
+            match display::capture_layout_for_virtual_removal(&self._conn, before).await {
+                Ok(layout) => layout,
+                Err(e) => {
+                    warn!(error = %e, "could not capture the current monitor layout before disconnect");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Stopping the remote-desktop session also stops the linked screen-cast
         // session; calling ScreenCast.Session.Stop directly is rejected.
         if let Err(e) = self.remote_desktop.stop().await {
             debug!(error = %e, "RemoteDesktop.Stop failed, trying ScreenCast.Stop");
             self.screen_cast.stop().await?;
+        }
+        if let Some(layout) = restore {
+            display::restore_layout_after_virtual_removal(&self._conn, &layout).await?;
         }
         info!("virtual monitor removed");
         Ok(())

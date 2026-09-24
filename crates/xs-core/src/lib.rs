@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 
 pub mod adaptive;
@@ -91,6 +91,7 @@ pub enum Event {
 pub struct EngineHandle {
     commands: mpsc::UnboundedSender<Command>,
     events: broadcast::Sender<Event>,
+    finished: watch::Receiver<bool>,
 }
 
 impl EngineHandle {
@@ -103,6 +104,17 @@ impl EngineHandle {
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
+
+    /// Request shutdown and wait until the display session has been closed.
+    pub async fn shutdown(&self) {
+        let mut finished = self.finished.clone();
+        self.send(Command::Shutdown);
+        while !*finished.borrow_and_update() {
+            if finished.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 /// Starts the engine on its own runtime in a background thread.
@@ -112,9 +124,11 @@ impl EngineHandle {
 pub fn spawn(config: SessionConfig) -> EngineHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, _) = broadcast::channel(64);
+    let (finished_tx, finished) = watch::channel(false);
     let handle = EngineHandle {
         commands: cmd_tx,
         events: event_tx.clone(),
+        finished,
     };
 
     std::thread::Builder::new()
@@ -131,10 +145,12 @@ pub fn spawn(config: SessionConfig) -> EngineHandle {
                     let _ = event_tx.send(Event::State(State::Failed {
                         message: format!("could not start engine: {e}"),
                     }));
+                    let _ = finished_tx.send(true);
                     return;
                 }
             };
             runtime.block_on(session::run(config, cmd_rx, event_tx));
+            let _ = finished_tx.send(true);
             debug!("engine thread finished");
         })
         .expect("spawning the engine thread should not fail");
@@ -204,6 +220,15 @@ pub type SharedStatsRef = Arc<SharedStats>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_engine_thread() {
+        let engine = spawn(SessionConfig::default());
+        tokio::time::timeout(Duration::from_secs(2), engine.shutdown())
+            .await
+            .expect("engine shutdown timed out");
+        assert!(*engine.finished.borrow());
+    }
 
     #[test]
     fn formats_bitrate_readably() {

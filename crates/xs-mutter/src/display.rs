@@ -65,6 +65,12 @@ pub(crate) struct DisplayLayout {
     properties: HashMap<String, OwnedValue>,
 }
 
+/// The physical layout as it stood at disconnect, plus the output to wait for.
+pub(crate) struct LayoutAfterRemoval {
+    removed_spec: MonitorSpec,
+    layout: DisplayLayout,
+}
+
 pub(crate) async fn capture_display_layout(conn: &Connection) -> Result<DisplayLayout> {
     let (_serial, monitors, logical, properties) = get_current_state(conn).await?;
     Ok(DisplayLayout {
@@ -72,6 +78,123 @@ pub(crate) async fn capture_display_layout(conn: &Connection) -> Result<DisplayL
         logical,
         properties,
     })
+}
+
+/// Keep the user's latest physical layout, including changes made while the
+/// tablet was connected. Remove only the virtual output owned by this session.
+pub(crate) async fn capture_layout_for_virtual_removal(
+    conn: &Connection,
+    before: &DisplayLayout,
+) -> Result<Option<LayoutAfterRemoval>> {
+    let layout = capture_display_layout(conn).await?;
+    let Some((spec, ..)) = new_virtual_monitor(&layout.monitors, before) else {
+        return Ok(None);
+    };
+    let removed_spec = spec.clone();
+    let layout = layout_without_monitor(layout, &removed_spec)?;
+    Ok(Some(LayoutAfterRemoval {
+        removed_spec,
+        layout,
+    }))
+}
+
+fn layout_without_monitor(
+    mut layout: DisplayLayout,
+    removed_spec: &MonitorSpec,
+) -> Result<DisplayLayout> {
+    layout.monitors.retain(|(spec, ..)| *spec != *removed_spec);
+    for (_, _, _, _, _, specs, _) in &mut layout.logical {
+        specs.retain(|spec| *spec != *removed_spec);
+    }
+    layout.logical.retain(|(.., specs, _)| !specs.is_empty());
+    if layout.logical.is_empty() {
+        return Err(Error::DisplayLayout(
+            "no physical monitor remains after removing the virtual display".into(),
+        ));
+    }
+
+    // Mutter requires the remaining layout to start at the origin. The virtual
+    // display may have been placed to the left or above a physical display.
+    let min_x = layout
+        .logical
+        .iter()
+        .map(|logical| logical.0)
+        .min()
+        .unwrap();
+    let min_y = layout
+        .logical
+        .iter()
+        .map(|logical| logical.1)
+        .min()
+        .unwrap();
+    for (x, y, ..) in &mut layout.logical {
+        *x -= min_x;
+        *y -= min_y;
+    }
+    if !layout.logical.iter().any(|logical| logical.4) {
+        layout.logical[0].4 = true;
+    }
+
+    Ok(layout)
+}
+
+/// Mutter reloads saved display settings when Meta-0 disappears. Restore the
+/// physical layout that was in use at disconnect once that reload has finished.
+pub(crate) async fn restore_layout_after_virtual_removal(
+    conn: &Connection,
+    expected: &LayoutAfterRemoval,
+) -> Result<()> {
+    let mut state = None;
+    for _ in 0..VIRTUAL_WAIT_TRIES {
+        let candidate = get_current_state(conn).await?;
+        if !candidate
+            .1
+            .iter()
+            .any(|(spec, ..)| spec == &expected.removed_spec)
+        {
+            state = Some(candidate);
+            break;
+        }
+        tokio::time::sleep(VIRTUAL_WAIT).await;
+    }
+    let Some((serial, monitors, logical, properties)) = state else {
+        return Err(Error::DisplayLayout(
+            "the virtual monitor did not disappear from DisplayConfig".into(),
+        ));
+    };
+
+    if monitors.len() != expected.layout.monitors.len()
+        || !expected
+            .layout
+            .monitors
+            .iter()
+            .all(|(old_spec, ..)| monitors.iter().any(|(now_spec, ..)| now_spec == old_spec))
+    {
+        return Err(Error::DisplayLayout(
+            "the connected monitors changed while stopping the stream".into(),
+        ));
+    }
+    if layout_matches(&expected.layout, &monitors, &logical, &properties, None) {
+        return Ok(());
+    }
+
+    let layout_mode =
+        prop_u32(&expected.layout.properties, "layout-mode").unwrap_or(LAYOUT_LOGICAL);
+    let applied = build_applied_existing_layout(&expected.layout, &monitors)?;
+    let mut apply_props: HashMap<String, Value<'static>> = HashMap::new();
+    if prop_bool(&properties, "supports-changing-layout-mode") {
+        apply_props.insert("layout-mode".into(), Value::from(layout_mode));
+    }
+    conn.call_method(
+        Some("org.gnome.Mutter.DisplayConfig"),
+        "/org/gnome/Mutter/DisplayConfig",
+        Some("org.gnome.Mutter.DisplayConfig"),
+        "ApplyMonitorsConfig",
+        &(serial, APPLY_TEMPORARY, applied, apply_props),
+    )
+    .await?;
+    info!("restored the physical monitor layout after disconnect");
+    Ok(())
 }
 
 /// Connector names mutter currently knows about (e.g. `["DP-3", "HDMI-1"]`).
@@ -156,7 +279,7 @@ pub(crate) async fn enable_virtual_monitor(
         .iter()
         .any(|(.., specs, _)| specs.iter().any(|s| s == spec));
     let existing_layout_unchanged =
-        existing_layout_matches(before, &monitors, &logical, &properties, spec);
+        layout_matches(before, &monitors, &logical, &properties, Some(spec));
     if virtual_active && existing_layout_unchanged {
         return Ok(());
     }
@@ -222,7 +345,28 @@ fn build_applied_layout(
     layout_mode: u32,
 ) -> Result<(Vec<AppliedLogicalMonitor>, i32, i32)> {
     let (x, y) = place_after_layout(&before.monitors, &before.logical, layout_mode);
-    let mut applied = Vec::with_capacity(before.logical.len() + 1);
+    let mut applied = build_applied_existing_layout(before, monitors)?;
+
+    applied.push((
+        x,
+        y,
+        virtual_scale,
+        0,
+        !before.logical.iter().any(|(.., primary, _, _)| *primary),
+        vec![(
+            virtual_spec.0.clone(),
+            virtual_mode.to_owned(),
+            monitor_apply_props(virtual_props),
+        )],
+    ));
+    Ok((applied, x, y))
+}
+
+fn build_applied_existing_layout(
+    before: &DisplayLayout,
+    monitors: &[Monitor],
+) -> Result<Vec<AppliedLogicalMonitor>> {
+    let mut applied = Vec::with_capacity(before.logical.len());
 
     for (lx, ly, scale, transform, primary, specs, _props) in &before.logical {
         let mut members = Vec::new();
@@ -255,19 +399,7 @@ fn build_applied_layout(
         applied.push((*lx, *ly, *scale, *transform, *primary, members));
     }
 
-    applied.push((
-        x,
-        y,
-        virtual_scale,
-        0,
-        !before.logical.iter().any(|(.., primary, _, _)| *primary),
-        vec![(
-            virtual_spec.0.clone(),
-            virtual_mode.to_owned(),
-            monitor_apply_props(virtual_props),
-        )],
-    ));
-    Ok((applied, x, y))
+    Ok(applied)
 }
 
 async fn get_current_state(conn: &Connection) -> Result<CurrentState> {
@@ -309,12 +441,12 @@ fn same_specs(a: &[MonitorSpec], b: &[MonitorSpec]) -> bool {
     a.len() == b.len() && a.iter().all(|spec| b.contains(spec))
 }
 
-fn existing_layout_matches(
+fn layout_matches(
     before: &DisplayLayout,
     monitors: &[Monitor],
     logical: &[LogicalMonitor],
     properties: &HashMap<String, OwnedValue>,
-    new_spec: &MonitorSpec,
+    new_spec: Option<&MonitorSpec>,
 ) -> bool {
     if prop_u32(&before.properties, "layout-mode") != prop_u32(properties, "layout-mode") {
         return false;
@@ -322,7 +454,7 @@ fn existing_layout_matches(
 
     let existing_logical: Vec<_> = logical
         .iter()
-        .filter(|(.., specs, _)| !specs.contains(new_spec))
+        .filter(|(.., specs, _)| new_spec.is_none_or(|spec| !specs.contains(spec)))
         .collect();
     if existing_logical.len() != before.logical.len() {
         return false;
@@ -636,12 +768,12 @@ mod tests {
             logical_monitor(3840, 0, false, virtual_spec.clone()),
         ];
         let properties = HashMap::from([("layout-mode".into(), OwnedValue::from(LAYOUT_LOGICAL))]);
-        assert!(!existing_layout_matches(
+        assert!(!layout_matches(
             &before,
             &monitors,
             &logical,
             &properties,
-            &virtual_spec,
+            Some(&virtual_spec),
         ));
 
         let (applied, x, y) = build_applied_layout(
@@ -660,5 +792,30 @@ mod tests {
         assert_eq!(applied[1].3, 1);
         assert_eq!(applied[0].5[0].1, "1920x1080");
         assert_eq!(applied[2].5[0].0, "Meta-0");
+    }
+
+    #[test]
+    fn removing_virtual_keeps_the_latest_physical_orientation() {
+        let physical = monitor_spec("eDP-1", "CMN");
+        let virtual_spec = monitor_spec("Meta-0", "MetaVendor");
+        let current = DisplayLayout {
+            monitors: vec![
+                active_monitor(physical.clone(), "1920x1080", 1920, 1080),
+                active_monitor(virtual_spec.clone(), "2304x1440", 2304, 1440),
+            ],
+            logical: vec![
+                logical_monitor(0, 0, true, virtual_spec.clone()),
+                logical_monitor(1536, 2, false, physical.clone()),
+            ],
+            properties: HashMap::from([("layout-mode".into(), OwnedValue::from(LAYOUT_LOGICAL))]),
+        };
+
+        let remaining = layout_without_monitor(current, &virtual_spec).unwrap();
+        assert_eq!(remaining.monitors.len(), 1);
+        assert_eq!(remaining.logical.len(), 1);
+        assert_eq!(remaining.logical[0].0, 0);
+        assert_eq!(remaining.logical[0].3, 2);
+        assert!(remaining.logical[0].4);
+        assert_eq!(remaining.logical[0].5, vec![physical]);
     }
 }

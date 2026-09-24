@@ -210,11 +210,11 @@ impl Active {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        if let Err(e) = self.mutter.close().await {
+            warn!(error = %e, "mutter session close");
+        }
         self.pipeline.stop();
         self.transport.disconnect().await;
-        if let Err(e) = self.mutter.close().await {
-            debug!(error = %e, "mutter session close");
-        }
         info!("session stopped");
     }
 }
