@@ -9,7 +9,7 @@ pkgname=(
   mutter-devkit
   mutter-docs
 )
-pkgver=50.4
+pkgver=50.5
 pkgrel=2
 pkgdesc="Window manager and compositor for GNOME"
 url="https://gitlab.gnome.org/GNOME/mutter"
@@ -89,10 +89,12 @@ source=(
   "git+$url.git#tag=${pkgver/[a-z]/.&}"
   "git+https://gitlab.gnome.org/GNOME/gvdb.git#commit=b54bc5da25127ef416858a3ad92e57159ff565b3"
   0001-virtual-monitor-guard-unconfigured-crtc.patch
+  0002-virtual-monitor-skip-null-stage-view.patch
 )
-b2sums=('5a03f66f1717f78a1964f62549876890f38bb8c43c4d0f7da59f1621baa8a372202805e5260fb5c6aeefee3e6f516fac501ebc27bb9b9cbe9bade5bbd200fbf9'
+b2sums=('1809a54d355194538db6128a91867799dc96c191e761c39e9952b54ace0868648dd62459f7eb047c21bc51e03377336563bdfc53876197ae53e0a74e94cd18c3'
         'f989bc2ceb52aad3c6a23c439df3bbc672bc11d561a247d19971d30cc85ed5d42295de40f8e55b13404ed32aa44f12307c9f5b470f2e288d1c9c8329255c43bf'
-        '6745903ff85aa2b797e11a2546e4f95539f4a1ccf945c43357c89fdf44bf95267d75bee318cf69ba76846ed59d9a359fbdb4958cf7448cd47cbf44543a50c0c1')
+        '6745903ff85aa2b797e11a2546e4f95539f4a1ccf945c43357c89fdf44bf95267d75bee318cf69ba76846ed59d9a359fbdb4958cf7448cd47cbf44543a50c0c1'
+        '69ba3779cfb2e374e8e3cb94a6046821072dfd421f25252ffe9afa579b25643c03b78941d10da172d4e1f72d815b9986aa2793b5490533ffcca8e92dc6cfea48')
 
 prepare() {
   cd mutter
@@ -101,6 +103,9 @@ prepare() {
   # SIGSEGVs gnome-shell and logs the session out. Reachable from any client of
   # org.gnome.Mutter.ScreenCast.RecordVirtual.
   git apply -v ../0001-virtual-monitor-guard-unconfigured-crtc.patch
+  # After that guard, RecordVirtual can finish with no renderer view. Cursor
+  # metadata then calls clutter_stage_view_schedule_update (NULL).
+  git apply -v ../0002-virtual-monitor-skip-null-stage-view.patch
 }
 
 build() {

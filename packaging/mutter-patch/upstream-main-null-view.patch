@@ -1,0 +1,189 @@
+diff --git a/src/backends/meta-stream-source-virtual.c b/src/backends/meta-stream-source-virtual.c
+index a99a38b..0ad1888 100644
+--- a/src/backends/meta-stream-source-virtual.c
++++ b/src/backends/meta-stream-source-virtual.c
+@@ -22,6 +22,7 @@
+ 
+ #include <spa/param/video/format-utils.h>
+ #include <spa/buffer/meta.h>
++#include <gio/gio.h>
+ 
+ #include "backends/meta-crtc-mode.h"
+ #include "backends/meta-cursor-tracker-private.h"
+@@ -163,7 +164,13 @@ static void
+ pointer_position_invalidated (MetaCursorTracker *cursor_tracker,
+                               MetaStreamSource  *source)
+ {
+-  clutter_stage_view_schedule_update (view_from_source (source));
++  ClutterStageView *view;
++
++  view = view_from_source (source);
++  if (!view)
++    return;
++
++  clutter_stage_view_schedule_update (view);
+ }
+ 
+ static void
+@@ -171,10 +178,15 @@ cursor_changed (MetaCursorTracker       *cursor_tracker,
+                 MetaStreamSourceVirtual *source_virtual)
+ {
+   MetaStreamSource *source = META_STREAM_SOURCE (source_virtual);
++  ClutterStageView *view;
+ 
+   source_virtual->cursor_bitmap_invalid = TRUE;
+ 
+-  clutter_stage_view_schedule_update (view_from_source (source));
++  view = view_from_source (source);
++  if (!view)
++    return;
++
++  clutter_stage_view_schedule_update (view);
+ }
+ 
+ static void
+@@ -252,6 +264,7 @@ setup_view (MetaStreamSourceVirtual *source_virtual,
+   MetaStream *stream = meta_stream_source_get_stream (source);
+   MetaStage *meta_stage = META_STAGE (stage_from_source (source));
+ 
++  g_return_if_fail (CLUTTER_IS_STAGE_VIEW (view));
+   g_return_if_fail (!source_virtual->paint_watch &&
+                     !source_virtual->skipped_watch);
+ 
+@@ -299,13 +312,20 @@ on_monitors_changed (MetaMonitorManager      *monitor_manager,
+ 
+   if (meta_stream_source_is_enabled (source))
+     {
+-      meta_stage_remove_watch (stage, source_virtual->paint_watch);
+-      source_virtual->paint_watch = NULL;
+-      meta_stage_remove_watch (stage, source_virtual->skipped_watch);
+-      source_virtual->skipped_watch = NULL;
++      if (source_virtual->paint_watch)
++        {
++          meta_stage_remove_watch (stage, source_virtual->paint_watch);
++          source_virtual->paint_watch = NULL;
++        }
++      if (source_virtual->skipped_watch)
++        {
++          meta_stage_remove_watch (stage, source_virtual->skipped_watch);
++          source_virtual->skipped_watch = NULL;
++        }
+ 
+       view = view_from_source (source);
+-      setup_view (source_virtual, view);
++      if (view)
++        setup_view (source_virtual, view);
+ 
+       meta_eis_viewport_notify_changed (META_EIS_VIEWPORT (stream));
+     }
+@@ -409,6 +429,13 @@ meta_stream_source_virtual_record_to_buffer (MetaStreamSource      *source,
+   float scale;
+ 
+   view = view_from_source (source);
++  if (!view)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                   "Virtual monitor has no stage view");
++      return FALSE;
++    }
++
+   framebuffer = clutter_stage_view_get_onscreen (view);
+   scale = clutter_stage_view_get_scale (view);
+   clutter_stage_view_get_layout (view, &view_rect);
+@@ -434,6 +461,13 @@ meta_stream_source_virtual_record_to_framebuffer (MetaStreamSource      *source,
+   CoglFramebuffer *view_framebuffer;
+ 
+   view = view_from_source (source);
++  if (!view)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                   "Virtual monitor has no stage view");
++      return FALSE;
++    }
++
+   view_framebuffer = clutter_stage_view_get_framebuffer (view);
+   if (damage ?
+       !cogl_framebuffer_blit_region (view_framebuffer,
+@@ -458,15 +492,21 @@ static void
+ meta_stream_source_virtual_queue_follow_up (MetaStreamSource     *source,
+                         MetaStreamRecordFlag  flags)
+ {
++  ClutterStageView *view;
++
++  view = view_from_source (source);
++  if (!view)
++    return;
++
+   if (flags & META_STREAM_RECORD_FLAG_CURSOR_ONLY)
+     {
+-      clutter_stage_view_schedule_update (view_from_source (source));
++      clutter_stage_view_schedule_update (view);
+     }
+   else
+     {
+       MtkRectangle damage;
+ 
+-      clutter_stage_view_get_layout (view_from_source (source), &damage);
++      clutter_stage_view_get_layout (view, &damage);
+       damage.width = 1;
+       damage.height = 1;
+ 
+@@ -482,11 +522,15 @@ is_cursor_in_stream (MetaStreamSourceVirtual *source_virtual)
+   MetaBackend *backend = backend_from_source (source);
+   MetaCursorRenderer *cursor_renderer =
+     meta_backend_get_cursor_renderer (backend);
+-  ClutterStageView *stage_view = view_from_source (source);
++  ClutterStageView *stage_view;
+   MtkRectangle view_layout;
+   graphene_rect_t view_rect;
+   ClutterCursor *cursor = NULL;
+ 
++  stage_view = view_from_source (source);
++  if (!stage_view)
++    return FALSE;
++
+   clutter_stage_view_get_layout (stage_view, &view_layout);
+   view_rect = mtk_rectangle_to_graphene_rect (&view_layout);
+ 
+@@ -541,6 +585,13 @@ get_cursor_position (MetaStreamSourceVirtual *source_virtual,
+   graphene_point_t cursor_position;
+ 
+   stage_view = view_from_source (source);
++  if (!stage_view)
++    {
++      *out_x = 0;
++      *out_y = 0;
++      return;
++    }
++
+   view_scale = clutter_stage_view_get_scale (stage_view);
+   clutter_stage_view_get_layout (stage_view, &view_layout);
+   view_rect = mtk_rectangle_to_graphene_rect (&view_layout);
+@@ -625,6 +676,9 @@ meta_stream_source_virtual_set_cursor_metadata (MetaStreamSource       *source,
+           float view_scale;
+ 
+           stage_view = view_from_source (source);
++          if (!stage_view)
++            return;
++
+           view_scale = clutter_stage_view_get_scale (stage_view);
+ 
+           meta_stream_source_set_cursor_sprite_metadata (source,
+@@ -774,10 +828,15 @@ meta_stream_source_virtual_notify_params_updated (MetaStreamSource          *sou
+ static void
+ meta_stream_source_virtual_dispatch (MetaStreamSource *source)
+ {
+-  ClutterStageView *view = view_from_source (source);
+-  ClutterFrameClock *frame_clock = clutter_stage_view_get_frame_clock (view);
++  ClutterStageView *view;
++  ClutterFrameClock *frame_clock;
+   ClutterFrameResult result;
+ 
++  view = view_from_source (source);
++  if (!view)
++    return;
++
++  frame_clock = clutter_stage_view_get_frame_clock (view);
+   result = clutter_frame_clock_dispatch (frame_clock, g_get_monotonic_time ());
+ 
+   switch (result)

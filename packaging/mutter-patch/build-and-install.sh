@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds mutter 50.4-2 (50.4 plus the unconfigured-CRTC guards) and installs it.
+# Builds mutter 50.5-2 (50.5 plus the ExtraSpace virtual-monitor crash guards)
+# and installs it.
 #
 # Needs sudo twice: once for makepkg to pull in build dependencies, once for
 # pacman to install the result. Nothing else on the system is touched -- the

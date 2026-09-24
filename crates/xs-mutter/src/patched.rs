@@ -29,18 +29,20 @@ pub fn scaled_modes_allowed() -> bool {
         if std::env::var_os("XS_MUTTER_MODES").is_none_or(|v| v != "1") {
             return false;
         }
-        match (patched_version(), installed_version()) {
-            (Some(patched), Some(installed)) if patched == installed => {
-                if running_shell_is_stale() {
-                    warn!(
-                        "libmutter has been replaced since gnome-shell started, so the running \
-                         compositor is still the unpatched one. Log out and back in; \
-                         XS_MUTTER_MODES is being ignored until then"
-                    );
-                    return false;
-                }
+        if patched_mutter_is_running() {
+            if let Some(installed) = installed_version() {
                 info!(mutter = %installed, "mutter is patched; using a scaled virtual monitor");
-                true
+            }
+            return true;
+        }
+        match (patched_version(), installed_version()) {
+            (Some(_patched), Some(_installed)) if running_shell_is_stale() => {
+                warn!(
+                    "libmutter has been replaced since gnome-shell started, so the running \
+                     compositor is still the unpatched one. Log out and back in; \
+                     XS_MUTTER_MODES is being ignored until then"
+                );
+                false
             }
             (Some(patched), Some(installed)) => {
                 warn!(
@@ -64,6 +66,17 @@ pub fn scaled_modes_allowed() -> bool {
             }
         }
     })
+}
+
+/// Installed mutter is the ExtraSpace rebuild *and* gnome-shell has mapped it.
+///
+/// `ApplyMonitorsConfig` on stock 50.4 races the virtual screen-cast source and
+/// SIGSEGVs gnome-shell, so layout changes go through this gate too.
+pub(crate) fn patched_mutter_is_running() -> bool {
+    match (patched_version(), installed_version()) {
+        (Some(patched), Some(installed)) if patched == installed => !running_shell_is_stale(),
+        _ => false,
+    }
 }
 
 /// Whether gnome-shell is still running against a libmutter that has since been

@@ -2,7 +2,7 @@
 
 ExtraSpace's sharp display path asks mutter for a virtual monitor at the
 tablet's full panel resolution, passing the UI scale as the mode's
-`preferred-scale`. On stock mutter 50.4 that logs you out.
+`preferred-scale`. On stock mutter 50.4 and 50.5 that logs you out.
 
 ## What goes wrong
 
@@ -19,15 +19,21 @@ dereference it anyway:
 Either one takes gnome-shell down with a SIGSEGV, which on Wayland means the
 session ends and every open application dies with it.
 
+Guarding the CRTC accessor lets `RecordVirtual` get past init when the new
+monitor still has no renderer view. Cursor metadata then calls
+`clutter_stage_view_schedule_update()` with NULL and gnome-shell dies the
+same way. `0002-virtual-monitor-skip-null-stage-view.patch` returns from those
+callers until a view exists.
+
 `0001-virtual-monitor-guard-unconfigured-crtc.patch` adds the missing checks and
 falls back to the mode that was requested, which is what the CRTC ends up using
 anyway. It touches no ABI: the soname stays `libmutter-18.so=0-64`, so
 gnome-shell does not need rebuilding.
 
 This is reported upstream as [mutter#5007][], and `UPSTREAM-REPORT.md` is the
-write-up that was filed. `upstream-main.patch` is the same fix ported to mutter
-`main`, where this code now lives in `meta-stream-source-virtual.c`. If upstream
-takes the fix, none of this directory is needed any more.
+write-up that was filed. `upstream-main.patch` is the CRTC fix ported to mutter
+`main`; `upstream-main-null-view.patch` is the stage-view follow-up. If upstream
+takes both, none of this directory is needed any more.
 
 [mutter#5007]: https://gitlab.gnome.org/GNOME/mutter/-/issues/5007
 
@@ -38,8 +44,9 @@ takes the fix, none of this directory is needed any more.
 ```
 
 Then log out and back in — a running compositor keeps the library it started
-with. `PKGBUILD` is Arch's `mutter` recipe with `pkgrel` bumped and the patch
+with. `PKGBUILD` is Arch's `mutter` recipe with `pkgrel` bumped and the patches
 added to `source`, so it tracks whatever version that recipe is based on.
+The current target is 50.5-2 (stock extra is 50.5-1).
 
 To go back to the stock package:
 

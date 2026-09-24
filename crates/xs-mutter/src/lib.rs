@@ -262,6 +262,18 @@ impl Session {
             }
         };
 
+        // mutter creates a virtual output with a fresh serial every session, so it
+        // never matches a saved layout and GNOME leaves it disabled. Turn it on
+        // beside the primary display once the PipeWire node exists.
+        if matches!(config.source, CaptureSource::Virtual) {
+            if let Err(e) = display::enable_virtual_monitor(&conn, config.scale).await {
+                warn!(
+                    error = %e,
+                    "could not turn the virtual monitor on; enable it in Settings → Displays"
+                );
+            }
+        }
+
         // What mutter actually configured. A saved layout can pin an older mode,
         // and the stream carries that size, not the one we asked for -- so read
         // it back rather than negotiating a format the node will never produce.
