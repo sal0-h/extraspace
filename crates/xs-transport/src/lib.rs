@@ -18,9 +18,14 @@ use xs_proto::ports;
 
 pub mod adb;
 pub mod frame;
+pub mod wireless;
 
 pub use adb::{Adb, Device, DeviceState};
 pub use frame::{Frame, FrameReader, FrameWriter};
+
+pub trait IoStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> IoStream for T {}
+pub type Socket = Box<dyn IoStream>;
 
 /// Android package of the companion app.
 pub const PACKAGE: &str = "io.github.tymonoman.extraspace";
@@ -62,9 +67,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A connected tablet with all three channels established.
 pub struct Transport {
     pub device: Device,
-    pub control: TcpStream,
-    pub video: TcpStream,
-    pub camera: TcpStream,
+    pub control: Socket,
+    pub video: Socket,
+    pub camera: Socket,
     adb: Adb,
     simulated: bool,
 }
@@ -148,9 +153,9 @@ impl Transport {
 
         Ok(Self {
             device,
-            control,
-            video,
-            camera,
+            control: Box::new(control),
+            video: Box::new(video),
+            camera: Box::new(camera),
             adb,
             simulated: false,
         })
@@ -171,9 +176,9 @@ impl Transport {
                 state: DeviceState::Ready,
                 model: Some("Simulated_Tablet".into()),
             },
-            control,
-            video,
-            camera,
+            control: Box::new(control),
+            video: Box::new(video),
+            camera: Box::new(camera),
             adb: Adb::find().unwrap_or_else(|_| Adb::none()),
             simulated: true,
         })
@@ -181,7 +186,7 @@ impl Transport {
 
     /// Splits into a teardown handle and the three sockets, so each can be moved
     /// into its own task.
-    pub fn split(self) -> (TransportHandle, TcpStream, TcpStream, TcpStream) {
+    pub fn split(self) -> (TransportHandle, Socket, Socket, Socket) {
         (
             TransportHandle {
                 device: self.device,
@@ -196,6 +201,9 @@ impl Transport {
 
     /// Removes the port forwards. Called on teardown; failures are logged only.
     pub async fn disconnect(&self) {
+        if self.simulated {
+            return;
+        }
         for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
             self.adb.remove_forward(&self.device.serial, port).await;
         }

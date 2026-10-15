@@ -26,6 +26,7 @@ struct Widgets {
     stack: gtk::Stack,
     status: adw::StatusPage,
     status_button: gtk::Button,
+    pair_button: gtk::Button,
     spinner: gtk::Spinner,
     window_title: adw::WindowTitle,
     toasts: adw::ToastOverlay,
@@ -75,9 +76,26 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     window.set_content(Some(&toolbar));
 
     let widgets = Rc::new(widgets);
+    let pairing = crate::pairing::PairingUi::new(&window, &engine);
+    for (name, show_devices) in [("pair-tablet", false), ("paired-devices", true)] {
+        let action = gtk::gio::SimpleAction::new(name, None);
+        let pairing = Rc::clone(&pairing);
+        action.connect_activate(move |_, _| {
+            if show_devices {
+                pairing.devices();
+            } else {
+                pairing.pair();
+            }
+        });
+        app.add_action(&action);
+    }
+    let pairing_button = Rc::clone(&pairing);
+    widgets.pair_button.connect_clicked(move |_| {
+        pairing_button.pair();
+    });
     wire_actions(app, &window);
     wire_controls(&widgets, &engine, &config);
-    listen_to_engine(&widgets, &engine);
+    listen_to_engine(&widgets, &engine, pairing);
 
     let engine_on_close = engine.clone();
     let closing = Rc::new(Cell::new(false));
@@ -130,6 +148,9 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .build();
     status_extra.append(&spinner);
     status_extra.append(&status_button);
+    let pair_button = gtk::Button::with_label("Pair tablet over Wi-Fi");
+    pair_button.add_css_class("pill");
+    status_extra.append(&pair_button);
 
     let status = adw::StatusPage::builder()
         .icon_name("computer-symbolic")
@@ -205,6 +226,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         stack: stack.clone(),
         status,
         status_button,
+        pair_button,
         spinner,
         window_title,
         toasts,
@@ -230,12 +252,20 @@ fn stat_row(title: &str, icon: &str) -> adw::ActionRow {
 
 fn gio_menu() -> gtk::gio::Menu {
     let menu = gtk::gio::Menu::new();
+    menu.append(Some("_Pair tablet"), Some("app.pair-tablet"));
+    menu.append(Some("Paired _devices"), Some("app.paired-devices"));
     menu.append(Some("_Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("_About Extraspace"), Some("app.about"));
+    menu.append(Some("_Quit"), Some("app.quit"));
     menu
 }
 
 fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    let close_window = window.clone();
+    quit.connect_activate(move |_, _| close_window.close());
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
     let about = gtk::gio::SimpleAction::new("about", None);
     let parent = window.clone();
     about.connect_activate(move |_, _| {
@@ -353,7 +383,11 @@ fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
         .set_subtitle(&format!("{scale}× — {description}"));
 }
 
-fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle) {
+fn listen_to_engine(
+    widgets: &Rc<Widgets>,
+    engine: &EngineHandle,
+    pairing: Rc<crate::pairing::PairingUi>,
+) {
     let mut events = engine.subscribe();
     let widgets = Rc::clone(widgets);
 
@@ -364,6 +398,14 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle) {
                 Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
                 Ok(Event::Warning(message)) => {
                     widgets.toasts.add_toast(adw::Toast::new(&message));
+                }
+                Ok(Event::Wireless(event)) => {
+                    pairing.event(&event);
+                    if let xs_core::WirelessEvent::Paired(peer) = event {
+                        widgets
+                            .toasts
+                            .add_toast(adw::Toast::new(&format!("{} paired", peer.name)));
+                    }
                 }
                 // Lagged means the UI fell behind a burst; the next state event
                 // resyncs it, so there is nothing useful to do but continue.
@@ -406,11 +448,11 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State) {
             widgets.window_title.set_subtitle("No tablet");
             show_status(
                 "phone-disconnected-symbolic",
-                "No tablet found",
-                "Connect your tablet over USB, then enable USB debugging:\n\n\
-                 1.  Settings → About tablet → tap “Build number” seven times\n\
-                 2.  Settings → System → Developer options → USB debugging",
-                Some("Check Again"),
+                "Ready for your tablet",
+                "Open Extraspace on your paired tablet on the same Wi-Fi.\n\n\
+                 First time? Choose “Pair tablet over Wi-Fi” below.\n\
+                 You can also connect your tablet with a USB cable.",
+                Some("Check USB connection"),
             );
         }
 

@@ -31,4 +31,28 @@
         android:textColor="#FFFFFF"
         android:textSize="18sp"
         android:text="@string/waiting_for_host" />
+
+    <LinearLayout
+        android:id="@+id/pairing_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="32dp"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/pair_computer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Pair computer"
+            android:textAllCaps="false" />
+
+        <Button
+            android:id="@+id/saved_computer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:text="Saved computer"
+            android:textAllCaps="false" />
+    </LinearLayout>
 </FrameLayout>

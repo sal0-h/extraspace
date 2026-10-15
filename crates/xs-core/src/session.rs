@@ -12,17 +12,16 @@
 //! * the adaptive controller -- the stats task feeds it, the UI retunes its bounds.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use xs_mutter::{CaptureSource, CursorMode, DisplayConfig};
 use xs_proto::{flags, Channel, ControlKind, Hello, TouchAction, TouchEvent, VideoConfig};
-use xs_transport::{FrameReader, FrameWriter, Transport, TransportHandle};
+use xs_transport::{FrameReader, FrameWriter, Socket, Transport, TransportHandle};
 use xs_video::{VideoConfig as PipelineConfig, VideoPipeline};
 
 use crate::adaptive::{AdaptiveController, BitrateBounds, HealthSample};
@@ -175,14 +174,15 @@ pub fn clamp_ui_scale(scale: f64) -> f64 {
     scale.clamp(1.0, 3.0)
 }
 
-type SharedWriter = Arc<Mutex<FrameWriter<OwnedWriteHalf>>>;
+type SharedWriter = Arc<Mutex<FrameWriter<tokio::io::WriteHalf<Socket>>>>;
 
 /// Everything belonging to one live connection.
 struct Active {
     transport: TransportHandle,
     /// Held open while the camera is off, so the channel survives until the user
     /// enables it. Closing it would take the whole adb forward down with it.
-    _idle_camera: Option<tokio::net::TcpStream>,
+    _idle_camera: Option<Socket>,
+    connected: Arc<AtomicBool>,
     mutter: Arc<xs_mutter::Session>,
     pipeline: Arc<VideoPipeline>,
     controller: Arc<Mutex<AdaptiveController>>,
@@ -223,6 +223,7 @@ pub async fn run(
     mut config: SessionConfig,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: broadcast::Sender<Event>,
+    wireless: Option<Arc<crate::Wireless>>,
 ) {
     let mut active: Option<Active> = None;
     let emit = |state: State| {
@@ -230,9 +231,40 @@ pub async fn run(
     };
     emit(State::Idle);
 
-    while let Some(command) = commands.recv().await {
+    let mut health = tokio::time::interval(Duration::from_secs(1));
+    let mut accept_wireless = true;
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => match command { Some(c) => c, None => break },
+            incoming = async {
+                match &wireless { Some(w) => w.accept().await, None => std::future::pending().await }
+            } => {
+                if let Some(transport) = incoming {
+                    if !accept_wireless { continue; }
+                    let peer_id = transport.device.serial.strip_prefix("wifi:");
+                    if !wireless.as_ref().is_some_and(|w| w.paired_devices().iter().any(|p| Some(p.id.as_str()) == peer_id)) { continue; }
+                    if let Some(current) = active.as_ref() {
+                        if current.transport.device.serial != transport.device.serial { continue; }
+                    }
+                    if let Some(current) = active.take() {
+                        current.shutdown().await;
+                        tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    }
+                    active = try_connect_transport(&config, &events, Some(transport)).await;
+                }
+                continue;
+            }
+            _ = health.tick() => {
+                if active.as_ref().is_some_and(|a| !a.connected.load(Ordering::Relaxed)) {
+                    if let Some(current) = active.take() { current.shutdown().await; }
+                    emit(State::NoTablet);
+                }
+                continue;
+            }
+        };
         match command {
             Command::Connect => {
+                accept_wireless = true;
                 if active.is_some() {
                     continue;
                 }
@@ -240,6 +272,7 @@ pub async fn run(
             }
 
             Command::Disconnect => {
+                accept_wireless = false;
                 if let Some(session) = active.take() {
                     session.shutdown().await;
                 }
@@ -318,6 +351,27 @@ pub async fn run(
                 }
                 break;
             }
+            Command::ForgetDevice(id) => {
+                if let Some(wireless) = &wireless {
+                    match wireless.forget(&id) {
+                        Ok(()) => {
+                            if active
+                                .as_ref()
+                                .is_some_and(|a| a.transport.device.serial == format!("wifi:{id}"))
+                            {
+                                if let Some(current) = active.take() {
+                                    current.shutdown().await;
+                                }
+                                emit(State::NoTablet);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(Event::Warning(format!("Could not forget device: {e}")));
+                        }
+                    }
+                }
+            }
         }
     }
     debug!("engine loop exited");
@@ -325,7 +379,15 @@ pub async fn run(
 
 /// Connects and reports the outcome, returning the session on success.
 async fn try_connect(config: &SessionConfig, events: &broadcast::Sender<Event>) -> Option<Active> {
-    match connect(config, events).await {
+    try_connect_transport(config, events, None).await
+}
+
+async fn try_connect_transport(
+    config: &SessionConfig,
+    events: &broadcast::Sender<Event>,
+    transport: Option<Transport>,
+) -> Option<Active> {
+    match connect(config, events, transport).await {
         Ok(session) => {
             let _ = events.send(Event::State(session.streaming_state()));
             Some(session)
@@ -341,11 +403,19 @@ async fn try_connect(config: &SessionConfig, events: &broadcast::Sender<Event>) 
 fn state_for_error(e: &anyhow::Error) -> State {
     // Surface the two failures the user can actually fix as their own states,
     // rather than burying them in a generic error string.
-    match e.downcast_ref::<xs_transport::adb::Error>() {
+    let adb_error = e.downcast_ref::<xs_transport::adb::Error>().or_else(|| {
+        match e.downcast_ref::<xs_transport::Error>() {
+            Some(xs_transport::Error::Adb(error)) => Some(error),
+            _ => None,
+        }
+    });
+    match adb_error {
         Some(xs_transport::adb::Error::Unauthorized(device)) => State::Unauthorized {
             device: device.clone(),
         },
-        Some(xs_transport::adb::Error::NoDevice) => State::NoTablet,
+        Some(xs_transport::adb::Error::NoDevice | xs_transport::adb::Error::AdbNotFound) => {
+            State::NoTablet
+        }
         _ => State::Failed {
             message: format!("{e:#}"),
         },
@@ -355,6 +425,7 @@ fn state_for_error(e: &anyhow::Error) -> State {
 async fn connect(
     config: &SessionConfig,
     events: &broadcast::Sender<Event>,
+    transport: Option<Transport>,
 ) -> anyhow::Result<Active> {
     let step = |s: &str| {
         let _ = events.send(Event::State(State::Connecting {
@@ -363,7 +434,10 @@ async fn connect(
     };
 
     step("Looking for your tablet…");
-    let transport = Transport::connect(config.apk_path.as_deref(), config.apk_version).await?;
+    let transport = match transport {
+        Some(transport) => transport,
+        None => Transport::connect(config.apk_path.as_deref(), config.apk_version).await?,
+    };
     let device_name = transport.device.display_name();
     let (handle, control, video, camera) = transport.split();
 
@@ -372,13 +446,17 @@ async fn connect(
     // forwarder tears down the entire unix socket to the device when either
     // direction closes. Splitting the camera stream and dropping its write half
     // therefore killed the channel, and the tablet's very next frame hit EPIPE.
-    let (control_rx, control_tx) = control.into_split();
+    let (control_rx, control_tx) = tokio::io::split(control);
 
     let mut control_reader = FrameReader::new(control_rx);
     let control_writer: SharedWriter = Arc::new(Mutex::new(FrameWriter::new(control_tx)));
 
     step("Waiting for the tablet to introduce itself…");
-    let hello = read_hello(&mut control_reader).await?;
+    let hello = tokio::time::timeout(Duration::from_secs(10), read_hello(&mut control_reader))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("The tablet did not respond. Reopen Extraspace on the tablet.")
+        })??;
     info!(
         device = %hello.device_name,
         panel = format!("{}x{}", hello.width, hello.height),
@@ -492,13 +570,16 @@ async fn connect(
     // matters and a stale one is never worth waiting for.
     let rtt_us = Arc::new(AtomicU64::new(0));
     let mut tasks = Vec::new();
+    let connected = Arc::new(AtomicBool::new(true));
 
     // --- video out -------------------------------------------------------
     let write_pace = Arc::new(WritePace::default());
     {
         let write_pace = Arc::clone(&write_pace);
+        let connected = Arc::clone(&connected);
         let mut video_writer = FrameWriter::new(video);
         tasks.push(tokio::spawn(async move {
+            let _closed = ConnectionClosed(connected);
             let mut last_start = Instant::now();
             while let Some(frame) = frames.recv().await {
                 let inter = last_start.elapsed();
@@ -571,21 +652,26 @@ async fn connect(
         let controller = Arc::clone(&controller);
         let rtt_us = Arc::clone(&rtt_us);
         let bitrate_tx = bitrate_tx.clone();
+        let connected_flag = Arc::clone(&connected);
 
         tasks.push(tokio::spawn(async move {
+            let _closed = ConnectionClosed(connected_flag);
             let mut fps = FpsCounter::new();
             let mut last_dropped = 0u64;
             let mut last_bytes = 0u64;
             let mut last_sample_at = Instant::now();
 
             loop {
-                let frame = match control_reader.read_frame().await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        debug!(error = %e, "control channel closed");
-                        break;
-                    }
-                };
+                let frame =
+                    match tokio::time::timeout(Duration::from_secs(5), control_reader.read_frame())
+                        .await
+                    {
+                        Ok(Ok(f)) => f,
+                        failure => {
+                            debug!(?failure, "control channel closed or stopped responding");
+                            break;
+                        }
+                    };
 
                 match frame.channel() {
                     Channel::Touch => {
@@ -759,6 +845,7 @@ async fn connect(
     Ok(Active {
         transport: handle,
         _idle_camera: idle_camera,
+        connected,
         mutter,
         pipeline,
         controller,
@@ -769,6 +856,13 @@ async fn connect(
         width,
         height,
     })
+}
+
+struct ConnectionClosed(Arc<AtomicBool>);
+impl Drop for ConnectionClosed {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -895,6 +989,17 @@ fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBoun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_usb_does_not_block_native_wifi_waiting_state() {
+        for error in [
+            xs_transport::adb::Error::NoDevice,
+            xs_transport::adb::Error::AdbNotFound,
+        ] {
+            let error = anyhow::Error::from(xs_transport::Error::Adb(error));
+            assert_eq!(state_for_error(&error), State::NoTablet);
+        }
+    }
 
     #[test]
     fn native_scale_streams_the_full_panel() {

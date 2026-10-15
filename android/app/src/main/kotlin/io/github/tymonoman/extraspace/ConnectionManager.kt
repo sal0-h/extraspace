@@ -3,11 +3,15 @@ package io.github.tymonoman.extraspace
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.Build
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -26,6 +30,7 @@ import kotlin.concurrent.thread
  */
 class ConnectionManager(
     private val callbacks: Callbacks,
+    private val wireless: WirelessChannels? = null,
 ) : Closeable {
 
     interface Callbacks {
@@ -41,13 +46,15 @@ class ConnectionManager(
     }
 
     private val running = AtomicBoolean(false)
+    private val ended = AtomicBoolean(false)
+    private val lifecycle = Any()
     private var controlServer: LocalServerSocket? = null
     private var videoServer: LocalServerSocket? = null
     private var cameraServer: LocalServerSocket? = null
 
-    private var controlSocket: LocalSocket? = null
-    @Volatile private var videoSocket: LocalSocket? = null
-    private var cameraSocket: LocalSocket? = null
+    private var controlSocket: ChannelSocket? = null
+    @Volatile private var videoSocket: ChannelSocket? = null
+    private var cameraSocket: ChannelSocket? = null
 
     private val videoReady = CountDownLatch(1)
 
@@ -61,20 +68,59 @@ class ConnectionManager(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        controlServer = LocalServerSocket(Protocol.Sockets.CONTROL)
-        videoServer = LocalServerSocket(Protocol.Sockets.VIDEO)
-        cameraServer = LocalServerSocket(Protocol.Sockets.CAMERA)
+        // Binding on the UI thread made a reconnect race fatal. A blocked
+        // accept can retain the old socket name briefly after shutdown.
+        thread(name = "xs-listeners") {
+            try {
+                if (wireless == null) {
+                    var bound = false
+                    for (attempt in 0 until 30) {
+                        if (!running.get()) return@thread
+                        try {
+                            synchronized(lifecycle) {
+                                if (!running.get()) return@thread
+                                controlServer = LocalServerSocket(Protocol.Sockets.CONTROL)
+                                videoServer = LocalServerSocket(Protocol.Sockets.VIDEO)
+                                cameraServer = LocalServerSocket(Protocol.Sockets.CAMERA)
+                            }
+                            bound = true
+                            break
+                        } catch (_: IOException) {
+                            synchronized(lifecycle) { closeListeners() }
+                            Thread.sleep(100)
+                        }
+                    }
+                    if (!bound) throw IOException("USB listener is still closing")
+                }
+                if (!running.get()) return@thread
+                thread(name = "xs-control") { runControl() }
+                thread(name = "xs-video") { runVideo() }
+                thread(name = "xs-camera") { runCamera() }
+                Log.i(TAG, if (wireless == null) "waiting for USB connection" else "authenticated Wi-Fi channels ready")
+            } catch (e: Exception) { reportDisconnected(e.message ?: "connection ended") }
+        }
+    }
 
-        thread(name = "xs-control") { runControl() }
-        thread(name = "xs-video") { runVideo() }
-        thread(name = "xs-camera") { runCamera() }
-        Log.i(TAG, "listening on all three sockets")
+    private fun reportDisconnected(reason: String) {
+        if (running.get() && ended.compareAndSet(false, true)) callbacks.onDisconnected(reason)
+    }
+
+    private fun closeListeners() {
+        listOf(controlServer, videoServer, cameraServer).forEach { server ->
+            if (server != null) {
+                // close() alone does not wake an accept blocked on another
+                // thread. shutdown() releases that thread and its socket name.
+                runCatching { Os.shutdown(server.fileDescriptor, OsConstants.SHUT_RDWR) }
+                runCatching { server.close() }
+            }
+        }
+        controlServer = null; videoServer = null; cameraServer = null
     }
 
     // ------------------------------------------------------------- control
     private fun runControl() {
         try {
-            val socket = controlServer!!.accept()
+            val socket = openChannel(controlServer, wireless?.control)
             controlSocket = socket
             val reader = FrameReader(socket.inputStream)
             val writer = FrameWriter(socket.outputStream)
@@ -128,7 +174,7 @@ class ConnectionManager(
         } catch (e: Exception) {
             if (running.get()) {
                 Log.e(TAG, "control channel failed", e)
-                callbacks.onDisconnected(e.message ?: "control channel closed")
+                reportDisconnected(e.message ?: "control channel closed")
             }
         }
     }
@@ -196,7 +242,7 @@ class ConnectionManager(
     // --------------------------------------------------------------- video
     private fun runVideo() {
         try {
-            videoServer!!.accept().use { socket ->
+            openChannel(videoServer, wireless?.video).use { socket ->
                 videoSocket = socket
                 // Control configuration runs on the main thread while video has its
                 // own socket. Keep the first access unit (including SPS/PPS) in the
@@ -224,7 +270,7 @@ class ConnectionManager(
         } catch (e: Exception) {
             if (running.get()) {
                 Log.e(TAG, "video channel failed", e)
-                callbacks.onDisconnected(e.message ?: "video channel closed")
+                reportDisconnected(e.message ?: "video channel closed")
             }
         }
     }
@@ -232,7 +278,7 @@ class ConnectionManager(
     // -------------------------------------------------------------- camera
     private fun runCamera() {
         try {
-            val socket = cameraServer!!.accept()
+            val socket = openChannel(cameraServer, wireless?.camera)
             cameraSocket = socket
             cameraWriter = FrameWriter(socket.outputStream)
             Log.i(TAG, "camera channel connected")
@@ -260,10 +306,21 @@ class ConnectionManager(
     override fun close() {
         running.set(false)
         videoReady.countDown()
-        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, videoSocket, cameraSocket)
+        synchronized(lifecycle) { closeListeners() }
+        listOf<Closeable?>(controlSocket, videoSocket, cameraSocket, wireless)
             .forEach { runCatching { it?.close() } }
         controlWriter = null
         cameraWriter = null
+    }
+
+    private class ChannelSocket(val inputStream: InputStream, val outputStream: OutputStream, val owner: Closeable) : Closeable {
+        override fun close() = owner.close()
+    }
+
+    private fun openChannel(server: LocalServerSocket?, socket: java.net.Socket?): ChannelSocket {
+        if (socket != null) return ChannelSocket(socket.getInputStream(), socket.getOutputStream(), socket)
+        val local = server!!.accept()
+        return ChannelSocket(local.inputStream, local.outputStream, local)
     }
 
     private companion object {

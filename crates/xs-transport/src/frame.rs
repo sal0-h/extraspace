@@ -111,6 +111,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         out.extend_from_slice(&header.encode());
         out.extend_from_slice(payload);
         self.inner.write_all(&out).await?;
+        self.inner.flush().await?;
         Ok(())
     }
 

@@ -34,8 +34,7 @@ capture, display scaling, and monitor layout preservation.
 - Full-range desktop color and optional native-panel rendering with GNOME
   scaling.
 - Physical monitor layout preservation when a virtual display opens or closes.
-- Experimental streaming through Android's secure wireless debugging ADB
-  connection.
+- Native Wi-Fi streaming with one-time QR or code pairing and saved device trust.
 - Arch packaging for the Mutter virtual-monitor crash guards, currently targeting
   Mutter 51.0.
 
@@ -43,8 +42,8 @@ capture, display scaling, and monitor layout preservation.
 
 - GNOME on Wayland. Extraspace uses Mutter's private D-Bus APIs; compatibility
   needs checking on each GNOME release.
-- An Android 11+ tablet with debugging enabled. USB needs a data cable; secure
-  Wireless debugging is an experimental alternative.
+- An Android 11+ tablet with the companion app installed. USB additionally needs
+  a data cable and USB debugging; native Wi-Fi works without debugging enabled.
 - Rust 1.96+ for the dependencies in `Cargo.lock`.
 - JDK 17 and the Android SDK to build the companion app.
 - GTK4, libadwaita, PipeWire, and GStreamer development packages.
@@ -149,30 +148,38 @@ and `XS_MUTTER_MODES=1`. Extraspace checks the installed patch marker and the
 running compositor before enabling it. After a Mutter upgrade, it falls back to
 the default path until the patched build is restored.
 
-## Experimental Wi-Fi connection
+## Wi-Fi connection
 
-Pair the computer once in **Settings > Developer options > Wireless debugging >
-Pair device with pairing code**. Accept the prompt to always allow debugging on
-your Wi-Fi network. The desktop launcher then looks for the paired wireless
-device and prefers it when available; USB remains the fallback. Android's
-wireless debugging toggle must be on, and the tablet and computer must be on the
-same trusted network. The launcher uses the Android SDK ADB client when present
-so it can discover the connection through mDNS. It waits briefly for discovery
-before opening the app.
+Open Extraspace from your computer's application menu. Choose **Pair tablet**,
+then open Extraspace on the tablet and tap **Pair computer**. Scan the QR code
+with the tablet camera, or enter the grouped code in the tablet app. Both devices
+must be on the same local network. Pairing codes expire after five minutes and
+can be used once.
 
-If you need to choose the connection manually while USB is also attached, first
-connect using the IP address and connection port shown on the tablet:
+After pairing, opening both apps reconnects automatically. No IP addresses,
+terminal commands, Android Wireless debugging, or repeat pairing are needed.
+Trust remains saved across app and computer restarts. Choose **Paired devices >
+Forget** on the computer or **Saved computer > Forget computer** on the tablet to
+revoke it. While streaming, Android's Back gesture opens the saved computer
+controls. Uninstalling the tablet app removes its saved pairing.
 
-```bash
-adb connect TABLET_IP:CONNECTION_PORT
-adb devices
-ANDROID_SERIAL=TABLET_IP:CONNECTION_PORT extraspace
-```
+Wi-Fi uses TLS 1.3 with a pinned computer identity and a separate random tablet
+credential. The tablet encrypts its credential with Android Keystore; the host
+keeps its identity and approved-device hashes in a private configuration file.
+Discovery does not grant permission. There is no account or cloud service.
 
-The pairing port and connection port are different. Wi-Fi performance depends
-on the network. In a short comparison at 1536×960 and 60 Hz, Wi-Fi held the
-average frame rate but showed more frame-timing spikes and higher round-trip
-latency than USB. See the [wireless comparison](docs/wireless-benchmark.md).
+The companion app must be installed once. An existing USB setup updates it
+automatically; alternatively install the matching APK on the tablet. USB works
+as before and can launch the companion without opening it yourself.
+
+Local network isolation or a firewall can prevent a connection. Allow Extraspace
+on your private network if prompted. QR pairing includes the current network
+address, and saved connections also try their last working address when
+discovery is unavailable.
+
+The earlier [wireless comparison](docs/wireless-benchmark.md) measured streaming
+over wireless ADB, before native Wi-Fi pairing was added. It is evidence about
+the network's performance, rather than a benchmark of the new TLS transport.
 
 ## Troubleshooting
 

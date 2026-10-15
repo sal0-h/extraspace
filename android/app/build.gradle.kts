@@ -11,7 +11,7 @@ android {
         applicationId = "io.github.tymonoman.extraspace"
         // The host refuses to talk to a mismatched app, so this is the number it
         // compares against when deciding whether to push a new APK.
-        versionCode = 9
+        versionCode = 11
         versionName = "0.1.0"
         // MediaFormat.KEY_LOW_LATENCY needs 30; below that the decoder buffers
         // several frames and the whole latency budget is gone.
@@ -42,4 +42,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity:1.9.3")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

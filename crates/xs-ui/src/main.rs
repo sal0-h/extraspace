@@ -8,6 +8,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 mod config;
+mod pairing;
 mod window;
 
 use config::Config;
@@ -30,6 +31,10 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
+        if let Some(window) = app.active_window() {
+            window.present();
+            return;
+        }
         let config = Rc::new(RefCell::new(Config::load()));
         let engine = xs_core::spawn(session_config(&config.borrow()));
         let diagnostic = gtk::gio::SimpleAction::new(
@@ -67,7 +72,7 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
 
 /// Must match `versionCode` in `android/app/build.gradle.kts`; the host pushes a
 /// new APK whenever the tablet has an older one.
-const APK_VERSION: u32 = 9;
+const APK_VERSION: u32 = 11;
 
 /// Finds the companion APK.
 ///

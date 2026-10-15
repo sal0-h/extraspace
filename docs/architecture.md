@@ -2,7 +2,7 @@
 
 Extraspace has a Rust host and a Kotlin Android companion. The host creates or
 captures a GNOME display, encodes its frames, and sends them through three
-ADB-forwarded sockets. The tablet decodes video, renders the cursor, and sends
+independent channels over USB or authenticated Wi-Fi. The tablet decodes video, renders the cursor, and sends
 touch events and optional camera frames back.
 
 ```mermaid
@@ -131,3 +131,45 @@ ffprobe -v error -show_streams /tmp/extraspace-video-sample/frame.h264
 The snapshot contains desktop pixels. The directory is private to your account,
 and files are only written when the action is requested. The saved frame is the
 latest keyframe, which may precede the request if the desktop has been idle.
+
+## Native Wi-Fi and saved trust
+
+The desktop app listens on TCP port 47471 (or an available port if occupied)
+while open, and advertises `_extraspace._tcp.local.` through DNS-SD. Android's
+NSD finds it; the last successful endpoint is also tried when discovery fails.
+The tablet opens three TLS 1.3 connections, preserving separate control, video,
+and camera channels. The codec and framing stay the same as USB.
+
+Pairing is explicitly enabled in the desktop GUI for five minutes. A fresh,
+one-use 100-bit code is shown as a QR and as five groups of four characters.
+The QR also includes the certificate fingerprint and current endpoints. Manual
+entry discovers candidate laptops but does not trust their advertisements.
+The pairing exchange uses HMAC-SHA256, with separate client/server domains,
+over the server certificate fingerprint and fresh nonces from both endpoints.
+Android verifies the server proof before releasing a newly generated 256-bit
+credential; the host requires the client proof before saving its hash. The code
+is never sent over the network. Codes are deliberately longer than six digits
+to resist offline guessing without requiring a password protocol.
+
+Subsequent channels require the saved credential inside TLS; Android requires
+the exact saved certificate. Credentials and video are never sent to a server
+with an unverified identity. Android encrypts the credential with an app-specific
+AES-GCM key in Android Keystore. The host saves its certificate, private key,
+and approved credential hashes in `~/.config/extraspace/wireless.json` (0600,
+within a 0700 directory), respecting `XDG_CONFIG_HOME`. App updates retain trust;
+forgetting a device removes trust and closes its active session. No ADB service
+is involved in native Wi-Fi, and no service stays running after Extraspace exits.
+
+Transport tests exercise real TLS, rejected unknown credentials, persistence,
+three-channel assembly, and rejection after revocation. On the SM-X510, live
+checks covered GUI pairing, retaining trust across an APK upgrade, two desktop
+close/reopen cycles without restarting the tablet process, reopening the tablet,
+and reopening both apps with the desktop first. Each reconnected without a
+Connect press or repeated pairing. Network changes still need separate testing.
+
+USB listener teardown explicitly shuts down blocked accepts before closing
+their file descriptors. Binding happens off the main thread with a brief retry
+window, and each connection reports a disconnect only once. Session-generation
+guards discard stale callbacks so simultaneous channel closures cannot tear
+down a new connection. The desktop detects a lost control channel and returns
+to its waiting screen while the Android client retries automatically.

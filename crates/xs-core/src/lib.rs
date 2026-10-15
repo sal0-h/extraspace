@@ -21,6 +21,7 @@ pub use session::{
     clamp_ui_scale, fallback_sizes, logical_size_for, modes_enabled, scaled_size_for,
     virtual_size_for, DisplayMode, SessionConfig,
 };
+pub use xs_transport::wireless::{PairedDevice, PairingOffer, Wireless, WirelessEvent};
 
 /// Events per second the tablet reports and the controller consumes.
 pub const STATS_HZ: u64 = 2;
@@ -39,9 +40,13 @@ pub enum Command {
     /// Change the quality envelope the adaptive controller works within.
     SetBitrateBounds(BitrateBounds),
     /// Start or stop camera passthrough.
-    SetCamera { enabled: bool, camera_id: String },
+    SetCamera {
+        enabled: bool,
+        camera_id: String,
+    },
     /// Save a decodable video frame and negotiated pipeline caps in a new directory.
     SaveVideoDiagnostic(std::path::PathBuf),
+    ForgetDevice(String),
     /// Shut the engine thread down.
     Shutdown,
 }
@@ -89,6 +94,7 @@ pub enum Event {
     Stats(Stats),
     /// Non-fatal; shown as a toast rather than replacing the whole view.
     Warning(String),
+    Wireless(WirelessEvent),
 }
 
 /// Handle the UI holds. Cloneable and cheap.
@@ -97,6 +103,7 @@ pub struct EngineHandle {
     commands: mpsc::UnboundedSender<Command>,
     events: broadcast::Sender<Event>,
     finished: watch::Receiver<bool>,
+    pub wireless: Option<Arc<Wireless>>,
 }
 
 impl EngineHandle {
@@ -127,6 +134,17 @@ impl EngineHandle {
 /// A dedicated thread rather than sharing the GTK main loop: GStreamer and zbus
 /// both want to block, and a stalled encoder must never freeze the window.
 pub fn spawn(config: SessionConfig) -> EngineHandle {
+    let wireless = if cfg!(test) {
+        None
+    } else {
+        match Wireless::new() {
+            Ok(wireless) => Some(wireless),
+            Err(e) => {
+                warn!(error = %e, "Wi-Fi unavailable");
+                None
+            }
+        }
+    };
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, _) = broadcast::channel(64);
     let (finished_tx, finished) = watch::channel(false);
@@ -134,6 +152,7 @@ pub fn spawn(config: SessionConfig) -> EngineHandle {
         commands: cmd_tx,
         events: event_tx.clone(),
         finished,
+        wireless: wireless.clone(),
     };
 
     std::thread::Builder::new()
@@ -154,7 +173,34 @@ pub fn spawn(config: SessionConfig) -> EngineHandle {
                     return;
                 }
             };
-            runtime.block_on(session::run(config, cmd_rx, event_tx));
+            runtime.block_on(async {
+                let service = wireless.as_ref().map(|wireless| {
+                    let wireless = Arc::clone(wireless);
+                    let events = event_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = wireless.serve().await {
+                            warn!(error = %e, "Wi-Fi service stopped");
+                            let _ = events.send(Event::Warning(format!("Wi-Fi: {e}")));
+                        }
+                    })
+                });
+                let updates = wireless.as_ref().map(|wireless| {
+                    let mut updates = wireless.subscribe();
+                    let events = event_tx.clone();
+                    tokio::spawn(async move {
+                        while let Ok(update) = updates.recv().await {
+                            let _ = events.send(Event::Wireless(update));
+                        }
+                    })
+                });
+                session::run(config, cmd_rx, event_tx, wireless).await;
+                if let Some(task) = service {
+                    task.abort();
+                }
+                if let Some(task) = updates {
+                    task.abort();
+                }
+            });
             let _ = finished_tx.send(true);
             debug!("engine thread finished");
         })
