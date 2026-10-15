@@ -34,6 +34,8 @@ capture, display scaling, and monitor layout preservation.
 - Full-range desktop color and optional native-panel rendering with GNOME
   scaling.
 - Physical monitor layout preservation when a virtual display opens or closes.
+- Experimental streaming through Android's secure wireless debugging ADB
+  connection.
 - Arch packaging for the Mutter virtual-monitor crash guards, currently targeting
   Mutter 51.0.
 
@@ -41,7 +43,8 @@ capture, display scaling, and monitor layout preservation.
 
 - GNOME on Wayland. Extraspace uses Mutter's private D-Bus APIs; compatibility
   needs checking on each GNOME release.
-- An Android 11+ tablet, a USB data cable, and USB debugging enabled.
+- An Android 11+ tablet with debugging enabled. USB needs a data cable; secure
+  Wireless debugging is an experimental alternative.
 - Rust 1.96+ for the dependencies in `Cargo.lock`.
 - JDK 17 and the Android SDK to build the companion app.
 - GTK4, libadwaita, PipeWire, and GStreamer development packages.
@@ -146,6 +149,27 @@ and `XS_MUTTER_MODES=1`. Extraspace checks the installed patch marker and the
 running compositor before enabling it. After a Mutter upgrade, it falls back to
 the default path until the patched build is restored.
 
+## Experimental Wi-Fi connection
+
+Extraspace can carry the screen stream over Android's secure wireless debugging
+connection. Pair the computer in **Settings > Developer options > Wireless
+debugging > Pair device with pairing code**, then connect using the device IP
+and connection port shown on the Wireless debugging screen:
+
+```bash
+adb pair TABLET_IP:PAIRING_PORT
+adb connect TABLET_IP:CONNECTION_PORT
+adb devices
+ANDROID_SERIAL=TABLET_IP:CONNECTION_PORT extraspace
+```
+
+The pairing port and connection port are different. `ANDROID_SERIAL` selects the
+Wi-Fi connection when USB is also attached; without it, Extraspace uses the
+first ready ADB device. Wi-Fi performance depends on the network. In a short
+comparison at 1536×960 and 60 Hz, Wi-Fi held the average frame rate but showed
+more frame-timing spikes and higher round-trip latency than USB. See the
+[wireless comparison](docs/wireless-benchmark.md).
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -177,8 +201,8 @@ The unit tests run without a tablet or an active GNOME session. For architecture
 crate responsibilities, and manual integration checks, see
 [architecture](docs/architecture.md) and [contributing](CONTRIBUTING.md).
 
-Keyboard passthrough, stylus pressure, Wi-Fi transport, audio, and live tablet
-rotation remain planned work.
+Keyboard passthrough, stylus pressure, audio, and live tablet rotation remain
+planned work.
 
 ## Credits and license
 

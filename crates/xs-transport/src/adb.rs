@@ -30,8 +30,11 @@ pub enum Error {
     #[error("io error running adb: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("no Android device connected over USB")]
+    #[error("no Android device connected to adb")]
     NoDevice,
+
+    #[error("Android device '{0}' selected by ANDROID_SERIAL is not connected and ready")]
+    SelectedDeviceUnavailable(String),
 
     #[error(
         "tablet '{0}' is connected but not authorised. Unlock it and accept the \
@@ -130,22 +133,13 @@ impl Adb {
     /// The single usable device, with actionable errors for the common failures.
     pub async fn require_device(&self) -> Result<Device> {
         let devices = self.devices().await?;
-        if let Some(d) = devices.iter().find(|d| d.state == DeviceState::Ready) {
-            return Ok(d.clone());
-        }
-        if let Some(d) = devices
-            .iter()
-            .find(|d| d.state == DeviceState::Unauthorized)
-        {
-            return Err(Error::Unauthorized(d.display_name()));
-        }
-        Err(Error::NoDevice)
+        let requested = std::env::var("ANDROID_SERIAL").ok();
+        select_device(&devices, requested.as_deref().filter(|s| !s.is_empty()))
     }
 
     /// Forwards a host TCP port to an abstract unix socket on the device.
     ///
-    /// This is the direction scrcpy uses and the reason throughput is good: the
-    /// bytes travel over the USB bulk endpoints adb already owns.
+    /// The selected adb connection carries the bytes, over either USB or Wi-Fi.
     pub async fn forward(&self, serial: &str, local_port: u16, remote_socket: &str) -> Result<()> {
         let local = format!("tcp:{local_port}");
         let remote = format!("localabstract:{remote_socket}");
@@ -225,6 +219,31 @@ impl Adb {
     }
 }
 
+fn select_device(devices: &[Device], requested: Option<&str>) -> Result<Device> {
+    if let Some(serial) = requested {
+        return match devices.iter().find(|device| device.serial == serial) {
+            Some(device) if device.state == DeviceState::Ready => Ok(device.clone()),
+            Some(device) if device.state == DeviceState::Unauthorized => {
+                Err(Error::Unauthorized(device.display_name()))
+            }
+            _ => Err(Error::SelectedDeviceUnavailable(serial.to_owned())),
+        };
+    }
+    if let Some(device) = devices
+        .iter()
+        .find(|device| device.state == DeviceState::Ready)
+    {
+        return Ok(device.clone());
+    }
+    if let Some(device) = devices
+        .iter()
+        .find(|device| device.state == DeviceState::Unauthorized)
+    {
+        return Err(Error::Unauthorized(device.display_name()));
+    }
+    Err(Error::NoDevice)
+}
+
 fn parse_device_line(line: &str) -> Option<Device> {
     let mut parts = line.split_whitespace();
     let serial = parts.next()?.to_string();
@@ -286,5 +305,42 @@ mod tests {
     fn ignores_malformed_lines() {
         assert!(parse_device_line("").is_none());
         assert!(parse_device_line("onlyserial").is_none());
+    }
+
+    #[test]
+    fn explicit_wireless_device_is_used_while_usb_is_connected() {
+        let devices = [
+            parse_device_line("usb-tablet device usb:1-1 model:Tablet").unwrap(),
+            parse_device_line("192.0.2.1:37123 device model:Tablet").unwrap(),
+        ];
+        let device = select_device(&devices, Some("192.0.2.1:37123")).unwrap();
+        assert_eq!(device.serial, "192.0.2.1:37123");
+        assert_eq!(select_device(&devices, None).unwrap().serial, "usb-tablet");
+    }
+
+    #[test]
+    fn unavailable_selection_does_not_silently_use_usb() {
+        let devices = [
+            parse_device_line("usb-tablet device usb:1-1").unwrap(),
+            parse_device_line("192.0.2.1:37123 offline").unwrap(),
+        ];
+        for serial in ["192.0.2.1:37123", "missing-tablet"] {
+            assert!(matches!(
+                select_device(&devices, Some(serial)),
+                Err(Error::SelectedDeviceUnavailable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn selected_unauthorized_device_keeps_the_authorization_error() {
+        let devices = [
+            parse_device_line("usb-tablet device usb:1-1").unwrap(),
+            parse_device_line("192.0.2.1:37123 unauthorized").unwrap(),
+        ];
+        assert!(matches!(
+            select_device(&devices, Some("192.0.2.1:37123")),
+            Err(Error::Unauthorized(_))
+        ));
     }
 }
