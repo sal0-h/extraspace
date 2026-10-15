@@ -21,14 +21,15 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build companion APK
         working-directory: android
         run: ./gradlew assembleRelease --no-daemon
 
-      # Named without a version so the download URL in the README stays valid
-      # across releases and the host's APK lookup does not need updating.
+      # Keep the asset name consistent with the host's installed APK path.
       - name: Stage artifacts
         run: |
           mkdir -p dist
@@ -44,11 +45,12 @@ jobs:
             ## Installing
 
             1. Download `extraspace.apk` below.
-            2. Build and run the desktop app:
+            2. Install the host dependencies listed in the
+               [README](https://github.com/sal0-h/extraspace#requirements).
+            3. Build and run the desktop app from the matching checkout:
 
                ```bash
-               ./scripts/setup.sh
-               cargo build --release
+               cargo build --release --locked
                EXTRASPACE_APK=~/Downloads/extraspace.apk ./target/release/extraspace
                ```
 

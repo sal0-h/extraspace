@@ -112,7 +112,7 @@ pub fn scaled_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32,
     let trim = |px: u32, floor: u32| -> u32 {
         let mut px = px.max(floor) & !1;
         // At most `quarters` steps down, so this is a handful of iterations.
-        while px > floor && (4 * px) % quarters != 0 {
+        while px > floor && !(4 * px).is_multiple_of(quarters) {
             px -= 2;
         }
         px

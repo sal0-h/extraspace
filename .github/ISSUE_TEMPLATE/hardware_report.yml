@@ -6,13 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Extraspace has only ever been proven on one tablet and one GNOME
-        version, so every data point from elsewhere is worth having — including
-        the boring "it just worked" ones, which are the hardest to find out
-        about and the most reassuring to everyone else.
-
-        Partial successes are especially welcome. "Display fine, camera dead"
-        is far more useful than silence.
+        Include your tablet model, Android version, GNOME version, and
+        distribution. Reports where everything works help us track
+        compatibility; partial results help us narrow down failures.
 
   - type: input
     id: tablet

@@ -1,90 +1,76 @@
 # Contributing
 
-## The most useful thing you can do
+This repository is Salman Hajizada's fork of
+[Tymonoman/extraspace](https://github.com/Tymonoman/extraspace). File issues and
+pull requests against [sal0-h/extraspace](https://github.com/sal0-h/extraspace).
 
-Run it on hardware that is not mine and say what happened. Extraspace is
-verified on exactly one tablet and one GNOME version; everything beyond that is
-untested. A [hardware report](https://github.com/Tymonoman/extraspace/issues/new?template=hardware_report.yml)
-takes two minutes and is worth more than most patches right now — including the
-boring "it just worked" ones.
+## Set up
 
-## You do not need a tablet to work on this
+Follow the [README](README.md#getting-started) to install host dependencies and
+build both the Rust host and Android companion. The setup script uses Fedora
+package names; use your own package manager on other distributions. Android
+builds use JDK 17.
 
-Most of the project can be developed and tested without an Android device.
+## Check a change
 
-```bash
-cargo test                                        # no hardware at all
-cargo run -p xs-core --example fake_tablet        # whole host pipeline
-cargo run -p xs-video --example capture_test      # capture and encode only
-cargo run -p xs-mutter --example virtual_monitor  # just the mutter side
-```
-
-`fake_tablet` stands in for the device: it listens on the three sockets, does
-the handshake, consumes the video stream and reports decode health. It exercises
-session orchestration, virtual monitor creation, capture, encoding, framing over
-real sockets, touch injection and the adaptive controller. The only things it
-cannot cover are MediaCodec and USB itself.
-
-You do need GNOME on Wayland, since the whole thing is built on mutter's D-Bus
-APIs.
-
-## Setting up
+Run the same Rust checks as CI:
 
 ```bash
-./scripts/setup.sh          # system packages, /dev/video10  (needs sudo)
-./scripts/install.sh        # app grid entry                 (no sudo)
-cd android && ./gradlew assembleRelease
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-## Before opening a PR
-
-CI runs these, so running them first saves a round trip:
+For Android changes:
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets   # CI treats warnings as errors
-cargo test --workspace
+(cd android && ./gradlew assembleRelease --no-daemon)
 ```
+
+For installer or packaging changes:
+
+```bash
+for script in scripts/*.sh packaging/mutter-patch/*.sh \
+  packaging/mutter-patch/PKGBUILD \
+  packaging/mutter-patch/extraspace-mutter-patch-check; do
+  bash -n "$script"
+done
+```
+
+Unit tests need no tablet or GNOME session. The manual capture and simulated
+tablet examples require GNOME on Wayland; see
+[integration examples](docs/architecture.md#integration-examples).
+
+## Keep the two halves compatible
+
+If you change `xs-proto`, update
+[Protocol.kt](android/app/src/main/kotlin/io/github/tymonoman/extraspace/Protocol.kt)
+to match. Build both halves from the same checkout.
+
+When the companion needs upgrading on existing tablets, update Android's
+`versionCode` and the host's `APK_VERSION` together. Keep the existing application
+identifiers compatible with installed copies.
 
 ## House style
 
-**Comments explain why, not what.** The code already says what it does. What it
-cannot say is that `vulkanh264enc` accepts a bitrate property and silently
-ignores it, or that `adb forward` accepts TCP connections to nothing. Those
-explanations are the reason this project was finishable, and several live in
-comments precisely so the next person does not rediscover them the hard way.
+Keep Mutter's private D-Bus API and display configuration code in `xs-mutter`.
+Keep transport framing separate from session policy.
 
-**Keep mutter-specific code in `xs-mutter`.** It is a private, unstable D-Bus
-API. Confining it to one crate means an upstream rename breaks one file rather
-than the whole app.
+Comments should explain decisions that are hard to infer from the code, such as
+ADB half-close behavior or encoder bitrate units. Describe the trigger and
+result of a fix in the commit message. For behavior changes, prefer tests that
+exercise the failing case.
 
-**Prefer a test that would have caught the bug.** The adaptive controller is
-pure and unit-tested for exactly this reason: it decides whether your display
-goes blurry, and that should not require a tablet to verify.
+The [architecture guide](docs/architecture.md) maps the crates and session flow.
+The [engineering notes](docs/engineering-notes.md) preserve earlier debugging
+results and measurements.
 
-## Where things live
+## Hardware reports
 
-| Crate | Responsibility |
-|---|---|
-| `xs-proto` | Wire protocol, mirrored by `Protocol.kt` on the Android side |
-| `xs-mutter` | Virtual monitor and input injection over D-Bus |
-| `xs-video` | PipeWire capture → H.264 |
-| `xs-transport` | adb orchestration, framed sockets |
-| `xs-camera` | H.264 → `/dev/video10` |
-| `xs-core` | Session orchestration, adaptive bitrate |
-| `xs-ui` | GTK4 / libadwaita front end |
+A [hardware report](https://github.com/sal0-h/extraspace/issues/new?template=hardware_report.yml)
+should include the tablet model, Android version, GNOME version, distribution,
+encoder, and which features worked. Partial results are useful too.
 
-If you change `xs-proto`, change `android/.../Protocol.kt` to match. They are
-checked against each other by a magic number at runtime, so a mismatch fails
-loudly on the first frame rather than corrupting quietly — but it still fails.
-
-## Things that would help most
-
-Roughly in order:
-
-1. Testing on other tablets and GNOME versions.
-2. Keyboard passthrough. Most of the groundwork exists in `xs-mutter::keys`
-   and `InputOnlySession`; what is missing is wiring the Android side to it.
-3. Wi-Fi transport. The protocol is transport-agnostic already; this is mostly
-   discovery and a second `Transport` backend.
-4. Stylus pressure, for tablets with an active pen.
+For bugs, include the host log from
+`RUST_LOG=debug ./target/release/extraspace` and, when relevant, the tablet log from
+`adb logcat -d -s extraspace:V`.

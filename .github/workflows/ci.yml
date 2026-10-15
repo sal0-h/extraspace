@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Keep CI honest: a warning that would be a review comment should fail here.
@@ -40,15 +43,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: Tests
         # The unit tests are deliberately hardware-free: protocol, adaptive
         # control, scaling maths and config all run on a bare runner.
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
   android:
     name: Android
@@ -62,6 +65,9 @@ jobs:
           java-version: '17'
 
       - uses: android-actions/setup-android@v3
+        with:
+          # The action defaults to the obsolete SDK package "tools".
+          packages: platform-tools
 
       - uses: gradle/actions/setup-gradle@v4
 
@@ -74,3 +80,17 @@ jobs:
           name: extraspace-apk
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+  shell:
+    name: Installer and packaging syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check scripts
+        run: |
+          for script in scripts/*.sh packaging/mutter-patch/*.sh \
+            packaging/mutter-patch/PKGBUILD \
+            packaging/mutter-patch/extraspace-mutter-patch-check; do
+            bash -n "$script"
+          done

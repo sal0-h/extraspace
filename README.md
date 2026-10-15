@@ -2,393 +2,188 @@
 
 # Extraspace
 
-**Turn an Android tablet into a real second monitor for GNOME — over USB, with touch.**
+Turn an Android tablet into a second monitor for GNOME over USB, with touch and camera passthrough.
 
-[![CI](https://github.com/Tymonoman/extraspace/actions/workflows/ci.yml/badge.svg)](https://github.com/Tymonoman/extraspace/actions/workflows/ci.yml)
+[![CI](https://github.com/sal0-h/extraspace/actions/workflows/ci.yml/badge.svg)](https://github.com/sal0-h/extraspace/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![GNOME](https://img.shields.io/badge/GNOME-46%2B-4A86CF.svg)](https://www.gnome.org)
-[![Wayland](https://img.shields.io/badge/Wayland-native-green.svg)](https://wayland.freedesktop.org)
+[![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange.svg)](https://www.rust-lang.org)
+[![GNOME / Wayland](https://img.shields.io/badge/GNOME-Wayland-4A86CF.svg)](https://www.gnome.org)
 
 ![Extraspace running on an Android tablet](assets/demo.gif)
 
-<sub>Recorded on the tablet itself. That is a GNOME monitor, not a screenshot —
-running over a USB cable, at ~1 ms round trip.</sub>
+<sub>Original upstream demo, recorded on the tablet.</sub>
 
 </div>
 
----
+Extraspace adds a virtual monitor to GNOME's display settings. Move windows onto
+the tablet, arrange it beside your physical displays, and use its touchscreen.
+The tablet can also send its camera back to Linux as a webcam through
+`/dev/video10`.
 
-Extraspace makes your Android tablet appear in **Settings → Displays** as a genuine
-monitor. Not a screen-share window, not a VNC session — a real output you can drag
-windows onto, arrange, and give its own workspaces. Touch the tablet and it drives
-the cursor there.
+This is [Salman Hajizada's fork](https://github.com/sal0-h/extraspace) of
+[Tymonoman/extraspace](https://github.com/Tymonoman/extraspace). It keeps the
+original project history and adds work on frame pacing, cursor rendering, GPU
+capture, display scaling, and monitor layout preservation.
 
-It also sends the tablet's camera back the other way, exposing it to Linux as an
-ordinary webcam that Firefox, Zoom, OBS and Cheese pick up automatically.
+## What this fork adds
 
-Everything runs over the **USB cable**. No network, no cloud, no account.
-
-```
-┌──────────────────────────┐         ┌────────────────────────┐
-│  GNOME / Wayland         │   USB   │  Android tablet        │
-│                          │◄───────►│                        │
-│  ┌────────┐  ┌────────┐  │         │   ┌────────────────┐   │
-│  │  DP-3  │  │ HDMI-1 │  │         │   │   Meta-0       │   │
-│  └────────┘  └────────┘  │         │   │  "Virtual      │   │
-│  ┌────────────────────┐  │         │   │   remote       │   │
-│  │      Meta-0        │──┼─────────┼──►│   monitor"     │   │
-│  │  (the tablet)      │◄─┼─ touch ─┼───│                │   │
-│  └────────────────────┘  │         │   └────────────────┘   │
-│  /dev/video10 ◄──────────┼── cam ──┼───  camera             │
-└──────────────────────────┘         └────────────────────────┘
-```
-
-## Why this exists
-
-Most "tablet as second screen" tools on Linux mirror an existing display, or need
-X11, or route video over Wi-Fi with the latency that implies. On GNOME Wayland
-specifically, creating a *new* output has historically meant DisplayLink drivers
-or the EVDI kernel module.
-
-It turns out mutter can already do it. `org.gnome.Mutter.ScreenCast` has a
-`RecordVirtual` method that creates a monitor with no backing hardware, and
-`org.gnome.Mutter.RemoteDesktop` can inject touch events whose coordinates are
-*relative to that stream* — so input lands on the right monitor with no geometry
-maths at all. Extraspace is a well-behaved GNOME app wrapped around those two APIs.
-
-## Status
-
-Everything below has been run end to end on real hardware — GNOME Shell 50.3
-driving a Telekom T Tablet (Wingtech, Android 15) over USB.
-
-| Piece | State |
-|---|---|
-| Virtual monitor creation, teardown | **Working** — appears alongside physical outputs |
-| Capture → H.264 encode | **Working** — 55 fps at 1332×800 via `x264enc` |
-| USB transport, handshake, APK auto-push | **Working** |
-| Tablet-side decode and display | **Working** — MediaCodec, `low-latency=true` |
-| Touch → cursor on the virtual monitor | **Working** — coordinates map exactly |
-| Adaptive bitrate control | **Working** — queue 0, RTT ~1 ms, probes upward |
-| Camera → `/dev/video10` | **Working** — 1920×1080 in any V4L2 app |
-| Keyboard, stylus, audio, Wi-Fi | Not started — see [Roadmap](#roadmap) |
-
-Measured on that setup: first frame **47 ms** after start, round trip **~1 ms**
-over USB, decoder input queue steady at **0**.
-
-This is a v0.1 that has been made to work on exactly one tablet and one GNOME
-version. Reports from other hardware are the most useful thing you can send.
-
-### Verifying it without a tablet
-
-Everything above the tablet's decoder can be exercised on one machine, which is
-also how you develop this if you do not have an Android device to hand.
-
-**The whole host pipeline, against a simulated tablet:**
-
-```console
-$ cargo run -p xs-core --example fake_tablet
-simulated tablet listening on 27183/27184/27185
-  [tablet] sent Hello (2000x1200)
-  [host] Creating the display…
-  [host] streaming 1332x800 via OpenH264 (software, fallback)
-  adapting bitrate new_kbps=7393
-  adapting bitrate new_kbps=8393
-
---- simulated tablet results ---
-  first video frame   152 ms after start
-  video frames        57
-  keyframes           3
-  pings answered      20
-  touch events sent   21
-
-  PASS
-```
-
-That covers session orchestration, the handshake, virtual monitor creation,
-capture, encoding, framing over real sockets, touch injection into the
-compositor, and the adaptive controller probing upward on healthy samples. It
-does not cover MediaCodec or anything USB-specific.
-
-**Just the capture half, writing a file you can inspect:**
-
-```console
-$ cargo run -p xs-video --example capture_test
-```
-
-It writes `/tmp/extraspace-capture.h264` — `ffprobe` confirms Constrained
-Baseline 1332×800, and `ffmpeg -i … -f null -` decodes every frame without error.
-
-If you try it and something breaks, an issue with `RUST_LOG=debug` output is very
-welcome.
+- Low-latency frame pacing and a cursor rendered on the tablet, so moving the
+  pointer does not require encoding another video frame.
+- GPU capture with DMA-BUF and VA-API encoding, with x264 or OpenH264 as the
+  software fallback.
+- Full-range desktop color and optional native-panel rendering with GNOME
+  scaling.
+- Physical monitor layout preservation when a virtual display opens or closes.
+- Arch packaging for the Mutter virtual-monitor crash guards, currently targeting
+  Mutter 51.0.
 
 ## Requirements
 
-- **GNOME 46 or newer on Wayland.** This is not portable to other compositors:
-  it depends on mutter-specific D-Bus APIs that KDE, Sway and friends do not have.
-  GNOME 50+ additionally lets the monitor be pinned to an exact mode.
-- An **Android 11+** tablet (API 30, for `MediaCodec` low-latency decoding).
-- A **USB cable** and USB debugging enabled on the tablet.
-- Any GPU. Encoding is done on the CPU by default and needs roughly one core.
+- GNOME on Wayland. Extraspace uses Mutter's private D-Bus APIs; compatibility
+  needs checking on each GNOME release.
+- An Android 11+ tablet, a USB data cable, and USB debugging enabled.
+- Rust 1.96+ for the dependencies in `Cargo.lock`.
+- JDK 17 and the Android SDK to build the companion app.
+- GTK4, libadwaita, PipeWire, and GStreamer development packages.
+- GStreamer's PipeWire plugin and a usable H.264 encoder: VA-API, x264, or
+  OpenH264.
+- Optional: `v4l2loopback` and `/dev/video10` for camera passthrough.
+
+Upstream recorded end-to-end results on GNOME Shell 50.3 with a Telekom T Tablet
+running Android 15. Those measurements are in the
+[engineering notes](docs/engineering-notes.md); they are historical results,
+not a claim that every device or GNOME version has been tested.
 
 ## Getting started
 
-Four steps, once. After that it is plug in the cable and open the app.
-
-### 1. Turn on USB debugging, on the tablet
-
-This is the step everyone forgets, and it is why most first runs fail.
-
-1. **Settings → About tablet** → tap **Build number** seven times.
-2. **Settings → System → Developer options** → turn on **USB debugging**.
-3. Plug in the USB cable. Accept the *Allow USB debugging?* prompt,
-   ticking **Always allow from this computer**.
-
-Skip step 3 and Extraspace will tell you exactly that, by name, rather than
-failing with something cryptic.
-
-> A surprising number of USB cables are charge-only and carry no data. If your
-> tablet charges but never appears, try a different cable before anything else.
-
-### 2. Set up the computer
+### 1. Clone this fork and install host dependencies
 
 ```bash
-git clone https://github.com/Tymonoman/extraspace
+git clone https://github.com/sal0-h/extraspace.git
 cd extraspace
+```
+
+On Fedora, the setup script installs system packages and configures the virtual
+camera. It needs `sudo` when making changes:
+
+```bash
+./scripts/setup.sh --check
 ./scripts/setup.sh
 ```
 
-This is the only step that needs `sudo`. It installs the GStreamer and GTK
-packages, creates `/dev/video10` for the camera so it survives reboots, and
-reports whether your tablet is visible. Run `./scripts/setup.sh --check` first if
-you would rather see what it intends to do — that needs no privileges at all.
+The script uses Fedora's `dnf` and RPM package names. On Arch, Ubuntu, or another
+distribution, install the dependencies listed above with your package manager.
+The native library packages and Ubuntu build dependencies are also listed in
+[CI](.github/workflows/ci.yml). Camera passthrough requires a loaded
+`v4l2loopback` module configured for `video_nr=10` and `exclusive_caps=1`.
 
-### 3. Get the companion app onto the tablet
+### 2. Enable USB debugging
 
-Download `extraspace.apk` from the
-[latest release](https://github.com/Tymonoman/extraspace/releases), then point
-Extraspace at it once:
+On the tablet, tap **Build number** seven times in **Settings > About tablet**,
+then enable **USB debugging** in **Developer options**. Connect the cable and
+accept the authorization prompt.
 
 ```bash
-EXTRASPACE_APK=~/Downloads/extraspace.apk cargo run --release
+adb devices
 ```
 
-It installs the app over USB for you — you never touch the tablet. From then on
-the host checks the installed version on every connect and upgrades it silently,
-so the two halves cannot drift apart, and you can drop the variable:
+Your tablet should appear with the state `device`. A charge-only cable will not
+work.
+
+### 3. Build both halves and run
+
+Use JDK 17 for Gradle. If your default Java is newer, set `JAVA_HOME` to your
+JDK 17 installation before building.
 
 ```bash
-cargo build --release
+(cd android && ./gradlew assembleRelease --no-daemon)
+cargo build --release --locked
 ./target/release/extraspace
 ```
 
-### 4. Add it to your applications
+Run from the repository root. Extraspace finds the locally built APK, installs it
+over USB when needed, and launches the companion app. Building both halves from
+the same checkout keeps the desktop and tablet protocols in sync.
 
-Optional, but you probably want it:
+Open **Extra Display** to start streaming. Arrange the new monitor in
+**Settings > Displays**.
+
+### 4. Install the desktop launcher
 
 ```bash
 ./scripts/install.sh
 ```
 
-Installs the binary, icon and desktop entry under `~/.local`, so Extraspace
-appears in your app grid and runs from anywhere as `extraspace`. No root needed
-— unlike `setup.sh`, this touches nothing system-wide. Undo it with
-`./scripts/install.sh --uninstall`.
+The installer copies the desktop binary, icon, launcher, and locally built APK
+under `~/.local`. Open Extraspace from the app grid or run `extraspace` in a
+terminal. It starts when you open it.
 
-### 5. Use it
+To uninstall:
 
-Open Extraspace and turn on **Extra Display**. The tablet switches to your
-desktop within about a second, and a new monitor appears in
-**Settings → Displays** that you can drag into position like any other.
+```bash
+./scripts/install.sh --uninstall
+```
 
-## Usage
+Your saved settings remain in `~/.config/extraspace`.
 
-| Setting | What it does |
+## Display scaling
+
+The default scale is 1.5×. The normal path creates a smaller virtual framebuffer
+and lets the tablet upscale it. For a 2000×1200 panel:
+
+| Scale | Stream resolution |
 |---|---|
-| **Mode** | *Extend* adds a new monitor. *Mirror* copies an existing one. |
-| **Scale** | How large the desktop is drawn on the tablet. See below. |
-| **Tablet Camera** | Feeds the tablet camera into `/dev/video10`. |
+| 1× | 2000×1200 |
+| 1.5× | 1332×800 |
+| 2× | 1000×600 |
 
-The camera appears as **“Extraspace Tablet Camera”** in Firefox, Zoom, OBS,
-Cheese and anything else that reads a webcam. It only shows up in those lists
-while Extraspace is actually running, so it does not clutter your camera picker
-the rest of the time.
+For sharper text, the optional native-panel path keeps the framebuffer near the
+tablet's full resolution and lets GNOME scale the UI. Dimensions may be trimmed
+slightly to keep logical pixels integral.
 
-### About scale
-
-A 10.4" tablet at its native 2000×1200 renders GNOME at a size that is technically
-correct and practically unreadable. Extraspace handles this by creating the
-virtual monitor *smaller* than the panel and letting the tablet upscale:
-
-| Scale | Monitor created | Result |
-|---|---|---|
-| 1× | 2000 × 1200 | Pin-sharp, very small text |
-| **1.5×** (default) | 1332 × 800 | Comfortable — the sweet spot |
-| 2× | 1000 × 600 | Large text, noticeably soft |
-
-Higher scale also costs less bandwidth, because there are fewer pixels to encode.
-
-## How it works
-
-The interesting part is the sequence, which is not obvious from mutter's interface
-XML and took some experimentation to get right:
-
-1. `RemoteDesktop.CreateSession()` → read its `SessionId`.
-2. `ScreenCast.CreateSession({"remote-desktop-session-id": id})`. **Linking the two
-   sessions is what makes injected input land on the virtual monitor.**
-3. `ScreenCast.Session.RecordVirtual({ modes, is-platform, cursor-mode })`.
-   - `is-platform: true` makes it a real monitor rather than a shared surface.
-   - `modes` pins it to an exact resolution so PipeWire cannot renegotiate it.
-4. Subscribe to `PipeWireStreamAdded` **before** starting, or the signal is missed.
-5. `RemoteDesktop.Session.Start()` — *not* `ScreenCast.Session.Start()`, which
-   mutter rejects for a linked session with *"Must be started from remote desktop
-   session"*. Teardown is symmetric.
-
-From there it is a normal GStreamer pipeline:
-
-```
-PipeWire capture + cursor overlay → appsrc → videorate (drop-only) → vapostproc → vah264lpenc → h264parse → appsink → USB
-```
-
-Frames are requested from mutter as dma-bufs, so they stay on the GPU from
-compositing through to encode. Where the VA-API plugin is missing, the same
-pipeline runs with `videoconvert → x264enc` over copied frames instead.
-
-and on the tablet, `MediaCodec` → `TextureView`. Touches travel back on a separate
-socket and become `NotifyTouchDown/Motion/Up` calls, whose coordinates are already
-in the virtual monitor's space.
-
-### Notes from building it
-
-Things that cost time, recorded so they cost you less:
-
-- **`vulkanh264enc` silently ignores its bitrate setting.** It advertises CBR and
-  accepts the property, but produces byte-identical output at 5, 15 and 40 Mbit/s.
-  Unusable for adaptive streaming. Extraspace does not offer it.
-- **Fedora strips NVENC out of GStreamer's `nvcodec` plugin.** Only the CUDA
-  utility elements register; `nvh264enc` does not exist, and `plugins-freeworld`
-  does not add it. `x264enc` at `veryfast` manages ~168 fps at 2000×1200 on a
-  mid-range CPU, which is 2.8× more than needed, so this matters less than it sounds.
-- **`x264enc` takes kbit/s but `openh264enc` takes bit/s.** A 1000× error waiting
-  to happen; the conversion lives in exactly one function.
-- **At panel resolution the cost is moving pixels, not encoding them.** A
-  2296×1428 frame is 13 MB, and the software chain moved it through DRAM four
-  times: mutter's readback, our copy, `videoconvert`, then x264. Measured on an
-  i7-1355U, `videoconvert` plus x264 cost 22.4 ms per frame — a 45 fps ceiling
-  before mutter did any work — and going from 2 to 6 x264 threads, or down to
-  `ultrafast`, recovered barely a tenth of it. VA-API encode of the same frames
-  costs about 1 ms, but swapping *only* the encoder gains nothing, because
-  uploading the frame costs what the conversion did. Taking dma-bufs from mutter
-  removes all four passes at once.
-- **A dma-buf's row pitch is not `width * 4`.** The GPU pads each row out to a
-  tile boundary: 2296 pixels are allocated as 9216 bytes rather than 9184, and
-  1316 as 5376 rather than 5264. Letting GStreamer infer the pitch from the caps
-  shifts every row and shears the image diagonally, so the pitch mutter reports
-  is attached to each buffer as a `GstVideoMeta`. Widths that happen to be
-  aligned — 1920 is exactly 15 tiles — look perfect either way, which makes this
-  a bug that only appears at the resolutions that matter. Verify at those.
-- **A slow consumer throttles the compositor.** Mutter will not produce a new
-  frame until the previous buffer comes back, so encoding speed sets the capture
-  rate rather than merely following it. Under one animated load at 1920×1080,
-  mutter delivered 14.5 fps to the software chain and 39.4 fps to the GPU one.
-- **USB 2.0 is not the bottleneck.** Raw 2000×1200@60 would need ~550 MB/s, far
-  beyond the ~30 MB/s a High Speed link gives you. Encoded H.264 at 15 Mbit/s is
-  under 2 MB/s — roughly 15× headroom.
-- **`adb forward` accepts connections to nothing.** adb accepts the *local* TCP
-  connection whether or not anything is listening on the device, then closes it
-  once the remote open fails. So `connect()` succeeds on the first attempt even
-  when the companion app has not started, and the failure appears milliseconds
-  later as an unexplained EOF mid-handshake. Retrying on connection-refused never
-  helps, because connection-refused never happens. The only reliable readiness
-  signal is bytes.
-- **Half-closing one direction kills the whole channel.** Tokio's
-  `OwnedWriteHalf` calls `shutdown(Write)` when dropped, and adb's forwarder tears
-  down the entire unix socket to the device when either direction closes. Splitting
-  a read-only stream and dropping the unused write half is therefore fatal — the
-  peer's next write gets EPIPE. Streams used one way are not split at all here.
-- **Mutter's embedded cursor only updates when the desktop is damaged.** Pointer
-  motion is a hardware plane, not damage, so a still window freezes the cursor.
-  Metadata mode plus a single PipeWire consumer that blits `SPA_META_Cursor` is
-  the fix. A second consumer (`pipewiresrc` plus a listener) makes
-  gst-plugin-pipewire abort on unfixed caps. A fullscreen GTK "damage pump"
-  becomes an opaque black window on Meta-0.
-- **Default `videorate` invents frames.** On a damage-driven capture (idle ~11
-  fps) it duplicates the last buffer to fill 60 fps holes and builds seconds of
-  fake catch-up latency. The pipeline is drop-only.
-- **Draining MediaCodec only when input arrives loses the last frame.** Because
-  mutter sends only on damage, an idle desktop delivers nothing for seconds at a
-  time; if output is drained inside the input path, the final frame stays decoded
-  but unrendered until something else changes. A dedicated drain thread fixed both
-  that and the queue-depth telemetry, which had been reporting a stuck 6–8 and
-  driving the bitrate to the floor for entire sessions.
-- **"60 fps" is a ceiling, not a rate.** Mutter only emits a frame when something
-  on the monitor actually changes, so a still desktop measures around **11 fps**
-  and well under 1 Mbit/s. That is exactly what you want — an idle screen should
-  be nearly free — but it quietly breaks anything that reasons in frame counts.
-  Both encoders express their keyframe interval in frames, so the obvious
-  `framerate × 2` puts keyframes *ten seconds* apart while idle, and a tablet
-  that reconnects sits on a black screen until one arrives. The interval is sized
-  against the idle rate instead, and a keyframe is requested explicitly whenever a
-  tablet attaches.
+This path requires the [patched Mutter build](packaging/mutter-patch/README.md)
+and `XS_MUTTER_MODES=1`. Extraspace checks the installed patch marker and the
+running compositor before enabling it. After a Mutter upgrade, it falls back to
+the default path until the patched build is restored.
 
 ## Troubleshooting
 
-**"No tablet found"** — check `adb devices`. If it is empty, the cable may be
-charge-only; many are. If it says `unauthorized`, accept the prompt on the tablet.
+| Symptom | Check |
+|---|---|
+| No tablet found | Run `adb devices`, accept USB authorization, and try a data cable. |
+| No usable H.264 encoder | Check `gst-inspect-1.0 vah264lpenc`, `x264enc`, or `openh264enc`; install the missing GStreamer plugin. |
+| Black screen or protocol mismatch | Rebuild both halves, then inspect `adb logcat -d -s extraspace:V` and the host debug log. |
+| Camera missing from apps | Check `/dev/video10` and enable Tablet Camera. With `exclusive_caps=1`, the webcam appears while frames are being sent. |
+| Native scaling ignored | Check the [Mutter patch instructions](packaging/mutter-patch/README.md), including the required logout after installation. |
 
-**"Something went wrong: no usable H.264 encoder"** — run
-`./scripts/setup.sh`, or install `gstreamer1-plugins-ugly` (x264) or
-`gstreamer1-plugin-openh264`.
+For host logs:
 
-**The virtual camera does not appear** — run `./scripts/setup.sh` to create
-`/dev/video10`. Note that `exclusive_caps=1` deliberately hides it from
-applications while nothing is feeding it, so it only shows up once streaming starts.
+```bash
+RUST_LOG=debug ./target/release/extraspace
+```
 
-**The tablet shows a black screen** — check `adb logcat -s extraspace`. A protocol
-mismatch is reported explicitly on both sides.
-
-## Roadmap
-
-- [ ] Keyboard passthrough (`NotifyKeyboardKeycode` — the plumbing is already there)
-- [ ] Stylus with pressure, for tablets with an active pen
-- [ ] Wi-Fi transport, reusing the same protocol
-- [ ] Audio to the tablet speakers
-- [ ] Tablet microphone as a PipeWire source
-- [ ] Camera controls: tap-to-focus, torch, zoom
-- [ ] Follow tablet rotation live
+Report problems in [this fork's issues](https://github.com/sal0-h/extraspace/issues)
+with your GNOME version, distribution, tablet model, and Android version.
 
 ## Development
 
 ```bash
-cargo test                                          # unit tests, no hardware needed
-cargo run -p xs-mutter --example virtual_monitor    # create a monitor for 5 seconds
-RUST_LOG=debug cargo run                            # verbose
-cd android && ./gradlew assembleRelease             # build the companion app
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-| Crate | Responsibility |
-|---|---|
-| `xs-proto` | Wire protocol, shared with the Kotlin side |
-| `xs-mutter` | Virtual monitor + input injection over D-Bus |
-| `xs-video` | PipeWire capture → H.264 |
-| `xs-transport` | adb orchestration, framed sockets |
-| `xs-camera` | H.264 → `/dev/video10` |
-| `xs-core` | Session orchestration, adaptive bitrate |
-| `xs-ui` | GTK4 / libadwaita front end |
+The unit tests run without a tablet or an active GNOME session. For architecture,
+crate responsibilities, and manual integration checks, see
+[architecture](docs/architecture.md) and [contributing](CONTRIBUTING.md).
 
-`xs-mutter` is the only crate that touches mutter's private D-Bus API, so if a
-future GNOME release changes it, the damage is contained to one file.
+Keyboard passthrough, stylus pressure, Wi-Fi transport, audio, and live tablet
+rotation remain planned work.
 
-## Contributing
+## Credits and license
 
-Issues and pull requests welcome. The most useful thing right now is testing on
-other tablets and other GNOME versions — please include your GNOME version,
-distribution, and tablet model.
-
-## License
+Originally created by [Tymonoman](https://github.com/Tymonoman). This fork is
+maintained by [Salman Hajizada](https://github.com/sal0-h), with upstream
+attribution and commit history preserved.
 
 [GPL-3.0-or-later](LICENSE).
-
-Note that the default encoder, x264, is itself GPL-licensed, so a distributed
-binary would carry GPL obligations regardless. Licensing the project this way
-keeps the situation unambiguous.
