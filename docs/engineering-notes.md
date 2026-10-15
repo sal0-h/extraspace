@@ -4,6 +4,10 @@ These notes preserve measurements and debugging results from the original
 project and later work in this fork. They describe the machines and software
 used at the time; they are not current benchmarks for every supported setup.
 
+The [October 2026 resolution comparison](resolution-benchmark.md) measures this
+fork on Salman's current tablet and explains why the smaller 1.5× stream remains
+the default.
+
 ## Original hardware results
 
 Everything below has been run end to end on real hardware — GNOME Shell 50.3

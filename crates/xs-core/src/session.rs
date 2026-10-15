@@ -634,7 +634,7 @@ async fn connect(
 
                         let now = Instant::now();
                         let (encoded, dropped, bytes) = stats_source.snapshot();
-                        fps.tick(now);
+                        fps.sample(now, device.frames_decoded);
 
                         let elapsed = now.duration_since(last_sample_at).as_secs_f64().max(0.001);
                         last_sample_at = now;
@@ -696,6 +696,7 @@ async fn connect(
                             fps: fps.fps(),
                             latency_ms: rtt.as_secs_f64() * 1000.0,
                             frames_encoded: encoded,
+                            frames_decoded: device.frames_decoded,
                             frames_dropped: total_dropped,
                             decode_queue_depth: device.decode_queue_depth,
                         }));

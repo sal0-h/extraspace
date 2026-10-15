@@ -95,6 +95,7 @@ active GNOME Wayland session and exercise real capture or virtual displays:
 
 ```bash
 cargo run -p xs-core --example fake_tablet
+cargo run --release -p xs-core --example resolution_bench
 cargo run -p xs-video --example capture_test
 cargo run -p xs-mutter --example virtual_monitor
 ```
@@ -102,6 +103,11 @@ cargo run -p xs-mutter --example virtual_monitor
 `fake_tablet` performs the handshake, consumes video, reports decoder health, and
 sends touch events through real sockets. It exercises the host pipeline but does
 not verify USB transport or Android's decoder.
+
+`resolution_bench` uses the real tablet and emits JSON measurements. Close the
+desktop app first; `XS_BENCH_SECONDS` bounds the run. The current resolution
+decision and its measurement limits are in the
+[resolution benchmark](resolution-benchmark.md).
 
 See the [engineering notes](engineering-notes.md) for earlier hardware results
 and the capture, encoder, and ADB behavior that motivated this design.

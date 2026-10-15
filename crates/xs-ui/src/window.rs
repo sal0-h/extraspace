@@ -77,7 +77,7 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     let widgets = Rc::new(widgets);
     wire_actions(app, &window);
     wire_controls(&widgets, &engine, &config);
-    listen_to_engine(&widgets, &engine, &config);
+    listen_to_engine(&widgets, &engine);
 
     let engine_on_close = engine.clone();
     let closing = Rc::new(Cell::new(false));
@@ -164,7 +164,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     let scale_refs: Vec<&str> = scale_labels.iter().map(String::as_str).collect();
     let scale_row = adw::ComboRow::builder()
         .title("Scale")
-        .subtitle("GNOME UI scale on native panel pixels")
+        .subtitle("Desktop size on the tablet")
         .model(&gtk::StringList::new(&scale_refs))
         .build();
     display_group.add(&scale_row);
@@ -185,7 +185,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     let stat_resolution = stat_row("Resolution", "video-display-symbolic");
     let stat_bitrate = stat_row("Bitrate", "network-transmit-symbolic");
     let stat_fps = stat_row("Frame Rate", "preferences-system-time-symbolic");
-    let stat_latency = stat_row("Latency", "network-wireless-symbolic");
+    let stat_latency = stat_row("Connection round trip", "network-wireless-symbolic");
     let stat_encoder = stat_row("Encoder", "applications-multimedia-symbolic");
     for row in [
         &stat_resolution,
@@ -343,20 +343,24 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
 
 fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
     let scale = config.borrow().scale;
-    widgets.scale_row.set_subtitle(&format!(
-        "{scale}× — how big the desktop looks, not how many pixels are sent"
-    ));
+    let description = if xs_core::modes_enabled() {
+        "GNOME scale at panel resolution"
+    } else {
+        "smaller video frame, enlarged on the tablet"
+    };
+    widgets
+        .scale_row
+        .set_subtitle(&format!("{scale}× — {description}"));
 }
 
-fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCell<Config>>) {
+fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle) {
     let mut events = engine.subscribe();
     let widgets = Rc::clone(widgets);
-    let config = Rc::clone(config);
 
     glib::spawn_future_local(async move {
         loop {
             match events.recv().await {
-                Ok(Event::State(state)) => apply_state(&widgets, &state, &config),
+                Ok(Event::State(state)) => apply_state(&widgets, &state),
                 Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
                 Ok(Event::Warning(message)) => {
                     widgets.toasts.add_toast(adw::Toast::new(&message));
@@ -370,7 +374,7 @@ fn listen_to_engine(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<Re
     });
 }
 
-fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>>) {
+fn apply_state(widgets: &Rc<Widgets>, state: &State) {
     let show_status = |icon: &str, title: &str, description: &str, button: Option<&str>| {
         widgets.status.set_icon_name(Some(icon));
         widgets.status.set_title(title);
@@ -445,12 +449,9 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State, config: &Rc<RefCell<Config>
         } => {
             widgets.window_title.set_subtitle(device);
             widgets.spinner.stop();
-            let scale = xs_core::clamp_ui_scale(config.borrow().scale);
-            let logical = xs_core::logical_size_for(*width, *height, scale);
-            widgets.stat_resolution.set_subtitle(&format!(
-                "{width} × {height} native — {}× UI ({} × {})",
-                scale, logical.0, logical.1
-            ));
+            widgets
+                .stat_resolution
+                .set_subtitle(&format!("{width} × {height} streamed"));
             widgets.stat_encoder.set_subtitle(encoder);
             widgets.stack.set_visible_child_name("running");
         }
