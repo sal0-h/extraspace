@@ -1112,7 +1112,12 @@ fn copy_bgra(src: &[u8], dest: &mut [u8]) {
 }
 
 fn swap_rb(src: &[u8], dest: &mut [u8]) {
-    for (px, dest) in src.chunks_exact(4).zip(dest.chunks_exact_mut(4)) {
+    for (px, dest) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dest.as_chunks_mut::<4>().0.iter_mut())
+    {
         dest[0] = px[2];
         dest[1] = px[1];
         dest[2] = px[0];
@@ -1121,7 +1126,12 @@ fn swap_rb(src: &[u8], dest: &mut [u8]) {
 }
 
 fn argb_to_bgrx(src: &[u8], dest: &mut [u8]) {
-    for (px, dest) in src.chunks_exact(4).zip(dest.chunks_exact_mut(4)) {
+    for (px, dest) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dest.as_chunks_mut::<4>().0.iter_mut())
+    {
         dest[0] = px[3];
         dest[1] = px[2];
         dest[2] = px[1];
