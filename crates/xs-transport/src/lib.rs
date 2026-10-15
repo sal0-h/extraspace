@@ -27,6 +27,21 @@ pub trait IoStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> IoStream for T {}
 pub type Socket = Box<dyn IoStream>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Adb,
+    Wifi,
+    Simulated,
+}
+
+pub enum ResumeAttempt {
+    /// The original cable/device is absent; another connection may be used.
+    Unavailable,
+    /// The device is present, but its app has not opened its listeners yet.
+    Waiting,
+    Connected(Transport),
+}
+
 /// Android package of the companion app.
 pub const PACKAGE: &str = "io.github.tymonoman.extraspace";
 /// Activity that renders the mirrored display.
@@ -71,32 +86,106 @@ pub struct Transport {
     pub video: Socket,
     pub camera: Socket,
     adb: Adb,
-    simulated: bool,
+    kind: TransportKind,
 }
 
 /// The teardown half of a [`Transport`], kept after the sockets are handed out.
 ///
 /// Splitting these apart lets the caller move each socket into its own task
 /// while still holding something that can undo the adb forwards afterwards.
+#[derive(Clone)]
 pub struct TransportHandle {
     pub device: Device,
     adb: Adb,
-    /// True for the fake-tablet path, where there is nothing for adb to undo.
-    simulated: bool,
+    kind: TransportKind,
 }
 
 impl TransportHandle {
     /// Removes the port forwards and stops the companion app.
     pub async fn disconnect(&self) {
-        if self.simulated {
-            debug!("simulated transport: nothing to tear down");
+        self.release().await;
+        if self.kind == TransportKind::Adb {
+            self.adb.force_stop(&self.device.serial, PACKAGE).await;
+        }
+    }
+
+    /// Close forwards without closing or relaunching the tablet app. Used for
+    /// recovery and settings changes; the user controls whether it is visible.
+    pub async fn release(&self) {
+        if self.kind != TransportKind::Adb {
             return;
         }
         for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
             self.adb.remove_forward(&self.device.serial, port).await;
         }
-        self.adb.force_stop(&self.device.serial, PACKAGE).await;
         debug!("transport torn down");
+    }
+
+    pub fn kind(&self) -> TransportKind {
+        self.kind
+    }
+
+    pub fn connection_name(&self) -> &'static str {
+        match self.kind {
+            TransportKind::Adb
+                if self.device.serial.contains(':') || self.device.serial.contains("_adb") =>
+            {
+                "Wi-Fi (debugging)"
+            }
+            TransportKind::Adb => "USB",
+            TransportKind::Wifi => "Wi-Fi",
+            TransportKind::Simulated => "Simulated",
+        }
+    }
+
+    /// Retry only this device and this transport. Never install, force-stop or
+    /// start an Android activity: a tablet sent Home must stay there.
+    pub async fn try_resume(&self) -> Result<ResumeAttempt> {
+        match self.kind {
+            TransportKind::Wifi => Ok(ResumeAttempt::Unavailable),
+            TransportKind::Simulated => {
+                Ok(ResumeAttempt::Connected(Transport::connect_fake().await?))
+            }
+            TransportKind::Adb => {
+                self.try_resume_adb([ports::CONTROL, ports::VIDEO, ports::CAMERA])
+                    .await
+            }
+        }
+    }
+
+    async fn try_resume_adb(&self, local_ports: [u16; 3]) -> Result<ResumeAttempt> {
+        let mut probe = probe_control(local_ports[0]).await?;
+        if matches!(probe, ControlProbe::NotForwarded) {
+            let devices = self.adb.devices().await?;
+            if !devices
+                .iter()
+                .any(|d| d.serial == self.device.serial && d.state == DeviceState::Ready)
+            {
+                return Ok(ResumeAttempt::Unavailable);
+            }
+            for (port, socket) in
+                local_ports
+                    .into_iter()
+                    .zip([sockets::CONTROL, sockets::VIDEO, sockets::CAMERA])
+            {
+                self.adb.forward(&self.device.serial, port, socket).await?;
+            }
+            probe = probe_control(local_ports[0]).await?;
+        }
+        let ControlProbe::Talking(control) = probe else {
+            return Ok(ResumeAttempt::Waiting);
+        };
+        let video = connect_with_retry(local_ports[1]).await?;
+        let camera = connect_with_retry(local_ports[2]).await?;
+        info!(serial = %self.device.serial, "resumed existing ADB connection without launching tablet app");
+        Ok(ResumeAttempt::Connected(Transport {
+            device: self.device.clone(),
+            control: Box::new(control),
+            video: Box::new(video),
+            camera: Box::new(camera),
+            adb: self.adb.clone(),
+            kind: self.kind,
+        }))
     }
 }
 
@@ -157,7 +246,7 @@ impl Transport {
             video: Box::new(video),
             camera: Box::new(camera),
             adb,
-            simulated: false,
+            kind: TransportKind::Adb,
         })
     }
 
@@ -180,7 +269,7 @@ impl Transport {
             video: Box::new(video),
             camera: Box::new(camera),
             adb: Adb::find().unwrap_or_else(|_| Adb::none()),
-            simulated: true,
+            kind: TransportKind::Simulated,
         })
     }
 
@@ -191,7 +280,7 @@ impl Transport {
             TransportHandle {
                 device: self.device,
                 adb: self.adb,
-                simulated: self.simulated,
+                kind: self.kind,
             },
             self.control,
             self.video,
@@ -201,14 +290,34 @@ impl Transport {
 
     /// Removes the port forwards. Called on teardown; failures are logged only.
     pub async fn disconnect(&self) {
-        if self.simulated {
-            return;
+        if self.kind == TransportKind::Adb {
+            for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
+                self.adb.remove_forward(&self.device.serial, port).await;
+            }
+            self.adb.force_stop(&self.device.serial, PACKAGE).await;
         }
-        for port in [ports::CONTROL, ports::VIDEO, ports::CAMERA] {
-            self.adb.remove_forward(&self.device.serial, port).await;
+    }
+}
+
+enum ControlProbe {
+    NotForwarded,
+    Waiting,
+    Talking(TcpStream),
+}
+
+async fn probe_control(port: u16) -> Result<ControlProbe> {
+    let stream = match TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(stream) => stream,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Ok(ControlProbe::NotForwarded)
         }
-        self.adb.force_stop(&self.device.serial, PACKAGE).await;
-        debug!("transport torn down");
+        Err(e) => return Err(e.into()),
+    };
+    stream.set_nodelay(true)?;
+    let mut byte = [0];
+    match tokio::time::timeout(Duration::from_millis(150), stream.peek(&mut byte)).await {
+        Ok(Ok(n)) if n > 0 => Ok(ControlProbe::Talking(stream)),
+        _ => Ok(ControlProbe::Waiting),
     }
 }
 
@@ -303,6 +412,112 @@ async fn connect_with_retry(port: u16) -> Result<TcpStream> {
                 tokio::time::sleep(CONNECT_RETRY_DELAY).await;
             }
             Err(_) => return Err(Error::ConnectTimeout { port }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn usb_recovery_waits_for_visibility_and_pins_the_original_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("commands");
+        let binary = directory.path().join("adb");
+        let write_adb = |devices: &str| {
+            std::fs::write(&binary, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n 'devices -l') printf '{}' ;;\n *'forward'*) exit 0 ;;\n *) exit 99 ;;\nesac\n", log.display(), devices
+            )).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let mut listeners = Vec::new();
+        let mut ports = [0; 3];
+        for port in &mut ports {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            *port = listener.local_addr().unwrap().port();
+            listeners.push(listener);
+        }
+        // Reserve distinct test ports, then simulate forwards removed on unplug.
+        drop(listeners);
+        let target = TransportHandle {
+            device: Device {
+                serial: "original-tablet".into(),
+                state: DeviceState::Ready,
+                model: Some("My tablet".into()),
+            },
+            adb: Adb::fixture(binary.clone()),
+            kind: TransportKind::Adb,
+        };
+        write_adb("List of devices attached\\nother-tablet device\\n");
+        assert!(matches!(
+            target.try_resume_adb(ports).await.unwrap(),
+            ResumeAttempt::Unavailable
+        ));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "devices -l");
+
+        write_adb("List of devices attached\\nother-tablet device\\noriginal-tablet device model:My_tablet\\n");
+        assert!(matches!(
+            target.try_resume_adb(ports).await.unwrap(),
+            ResumeAttempt::Waiting
+        ));
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            commands.lines().filter(|l| l.contains("forward")).count(),
+            3
+        );
+        assert!(commands
+            .lines()
+            .filter(|l| l.contains("forward"))
+            .all(|l| l.starts_with("-s original-tablet forward ")));
+        assert!(!commands.contains("shell"));
+        assert!(!commands.contains("install"));
+
+        // ADB accepts a forwarded TCP socket even while Android is hidden.
+        // EOF from that phantom connection must not count as a resumed tablet.
+        let phantom = tokio::net::TcpListener::bind(("127.0.0.1", ports[0]))
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = phantom.accept().await.unwrap();
+        });
+        assert!(matches!(
+            target.try_resume_adb(ports).await.unwrap(),
+            ResumeAttempt::Waiting
+        ));
+        task.await.unwrap();
+
+        // Reopening the tablet app publishes Hello, which the passive probe
+        // must leave untouched for the normal session handshake.
+        let mut tasks = Vec::new();
+        for (index, port) in ports.into_iter().enumerate() {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            tasks.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                if index == 0 {
+                    socket.write_all(b"hello").await.unwrap();
+                }
+                std::future::pending::<()>().await;
+                drop(socket);
+            }));
+        }
+        let ResumeAttempt::Connected(mut transport) = target.try_resume_adb(ports).await.unwrap()
+        else {
+            panic!("tablet did not resume")
+        };
+        assert_eq!(transport.device.serial, "original-tablet");
+        let mut hello = [0; 5];
+        transport.control.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"hello");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), commands);
+        for task in tasks {
+            task.abort();
         }
     }
 }

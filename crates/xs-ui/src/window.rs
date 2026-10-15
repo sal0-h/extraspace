@@ -37,6 +37,7 @@ struct Widgets {
     camera_switch: adw::SwitchRow,
 
     stat_resolution: adw::ActionRow,
+    stat_connection: adw::ActionRow,
     stat_bitrate: adw::ActionRow,
     stat_fps: adw::ActionRow,
     stat_latency: adw::ActionRow,
@@ -95,7 +96,33 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     });
     wire_actions(app, &window);
     wire_controls(&widgets, &engine, &config);
-    listen_to_engine(&widgets, &engine, pairing);
+    // Keep application actions on the same controls as user interaction. These
+    // also let diagnostics read the actual session state without guessing from
+    // open sockets, which may belong to an incomplete connection attempt.
+    let session_state =
+        gtk::gio::SimpleAction::new_stateful("session-state", None, &"\"Idle\"".to_variant());
+    session_state.set_enabled(false);
+    app.add_action(&session_state);
+    let set_scale = gtk::gio::SimpleAction::new("set-scale", Some(&f64::static_variant_type()));
+    let scale_row = widgets.scale_row.clone();
+    set_scale.connect_activate(move |_, parameter| {
+        if let Some(scale) = parameter
+            .and_then(|p| p.get::<f64>())
+            .filter(|s| s.is_finite())
+        {
+            scale_row.set_selected(scale_index(scale));
+        }
+    });
+    app.add_action(&set_scale);
+    let set_mode = gtk::gio::SimpleAction::new("set-mode", Some(&String::static_variant_type()));
+    let mode_row = widgets.mode_row.clone();
+    set_mode.connect_activate(move |_, parameter| match parameter.and_then(|p| p.str()) {
+        Some("extend") => mode_row.set_selected(0),
+        Some("mirror") => mode_row.set_selected(1),
+        _ => {}
+    });
+    app.add_action(&set_mode);
+    listen_to_engine(&widgets, &engine, pairing, session_state);
 
     let engine_on_close = engine.clone();
     let closing = Rc::new(Cell::new(false));
@@ -203,12 +230,14 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
     prefs.add(&camera_group);
 
     let stats_group = adw::PreferencesGroup::builder().title("Statistics").build();
+    let stat_connection = stat_row("Connection", "network-transmit-receive-symbolic");
     let stat_resolution = stat_row("Resolution", "video-display-symbolic");
     let stat_bitrate = stat_row("Bitrate", "network-transmit-symbolic");
     let stat_fps = stat_row("Frame Rate", "preferences-system-time-symbolic");
     let stat_latency = stat_row("Connection round trip", "network-wireless-symbolic");
     let stat_encoder = stat_row("Encoder", "applications-multimedia-symbolic");
     for row in [
+        &stat_connection,
         &stat_resolution,
         &stat_bitrate,
         &stat_fps,
@@ -235,6 +264,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         scale_row,
         camera_switch,
         stat_resolution,
+        stat_connection,
         stat_bitrate,
         stat_fps,
         stat_latency,
@@ -387,6 +417,7 @@ fn listen_to_engine(
     widgets: &Rc<Widgets>,
     engine: &EngineHandle,
     pairing: Rc<crate::pairing::PairingUi>,
+    session_state: gtk::gio::SimpleAction,
 ) {
     let mut events = engine.subscribe();
     let widgets = Rc::clone(widgets);
@@ -394,7 +425,12 @@ fn listen_to_engine(
     glib::spawn_future_local(async move {
         loop {
             match events.recv().await {
-                Ok(Event::State(state)) => apply_state(&widgets, &state),
+                Ok(Event::State(state)) => {
+                    if let Ok(serialized) = serde_json::to_string(&state) {
+                        session_state.set_state(&serialized.to_variant());
+                    }
+                    apply_state(&widgets, &state);
+                }
                 Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
                 Ok(Event::Warning(message)) => {
                     widgets.toasts.add_toast(adw::Toast::new(&message));
@@ -483,13 +519,32 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State) {
             widgets.stack.set_visible_child_name("status");
         }
 
+        State::WaitingForTablet { device, connection } => {
+            widgets
+                .window_title
+                .set_subtitle(&format!("Waiting · {connection}"));
+            let description = if connection == "Wi-Fi" {
+                format!("Open Extraspace on {device} on the same Wi-Fi. It will reconnect automatically.")
+            } else {
+                format!("Open Extraspace on {device} to resume over {connection}. If the cable is unplugged, reconnect it.")
+            };
+            show_status(
+                "phone-disconnected-symbolic",
+                "Waiting for your tablet",
+                &description,
+                None,
+            );
+        }
+
         State::Streaming {
             device,
+            connection,
             width,
             height,
             encoder,
         } => {
             widgets.window_title.set_subtitle(device);
+            widgets.stat_connection.set_subtitle(connection);
             widgets.spinner.stop();
             widgets
                 .stat_resolution

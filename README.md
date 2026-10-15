@@ -177,6 +177,12 @@ The companion app must be installed once. An existing USB setup updates it
 automatically; alternatively install the matching APK on the tablet. USB works
 as before and can launch the companion without opening it yourself.
 
+The desktop app's **Connection** row shows which connection is in use. Changing
+scale or display mode reconnects to the same tablet over the same connection,
+including Wi-Fi when a USB cable is also attached. During a USB session, going
+Home pauses the display; reopening Extraspace on the tablet resumes over USB
+automatically. Recovery waits for the tablet app instead of opening it for you.
+
 Local network isolation or a firewall can prevent a connection. Allow Extraspace
 on your private network if prompted. QR pairing includes the current network
 address, and saved connections also try their last working address when

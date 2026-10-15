@@ -78,6 +78,11 @@ pub struct Adb {
 }
 
 impl Adb {
+    #[cfg(test)]
+    pub(crate) fn fixture(binary: PathBuf) -> Self {
+        Self { binary }
+    }
+
     /// Locates `adb` on `PATH`.
     pub fn find() -> Result<Self> {
         which("adb")
@@ -99,6 +104,7 @@ impl Adb {
         let output = Command::new(&self.binary)
             .args(args)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await?;
 

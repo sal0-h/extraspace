@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio_rustls::{rustls, TlsAcceptor};
 use tracing::{debug, warn};
 
-use crate::{Adb, Device, DeviceState, Socket, Transport};
+use crate::{Adb, Device, DeviceState, Socket, Transport, TransportKind};
 
 pub const SERVICE_TYPE: &str = "_extraspace._tcp.local.";
 const PAIR_LIFETIME: Duration = Duration::from_secs(300);
@@ -86,6 +87,7 @@ pub struct Wireless {
     incoming_tx: mpsc::Sender<Transport>,
     incoming_rx: tokio::sync::Mutex<mpsc::Receiver<Transport>>,
     events: broadcast::Sender<WirelessEvent>,
+    accepting: AtomicBool,
 }
 
 impl Wireless {
@@ -153,6 +155,7 @@ impl Wireless {
             incoming_tx,
             incoming_rx: tokio::sync::Mutex::new(incoming_rx),
             events,
+            accepting: AtomicBool::new(true),
         });
         this.save(&this.inner.lock().unwrap().saved)?;
         Ok(this)
@@ -223,6 +226,15 @@ impl Wireless {
 
     pub async fn accept(&self) -> Option<Transport> {
         self.incoming_rx.lock().await.recv().await
+    }
+
+    /// Reject competing data connections before telling the tablet it is ready.
+    /// Pairing remains available even while an existing USB session is in use.
+    pub fn set_accepting(&self, accepting: bool) {
+        self.accepting.store(accepting, Ordering::Relaxed);
+        if !accepting {
+            self.inner.lock().unwrap().pending.clear();
+        }
     }
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
@@ -349,6 +361,10 @@ impl Wireless {
                 let _ = self.events.send(WirelessEvent::Paired(peer));
             }
             "channel" => {
+                ensure!(
+                    self.accepting.load(Ordering::Relaxed),
+                    "Another connection is selected"
+                );
                 let id = sha256(field(&hello, "token")?.as_bytes());
                 let session = field(&hello, "session")?;
                 ensure!(
@@ -381,6 +397,10 @@ impl Wireless {
                 }
                 write_json(&mut stream, &json!({"kind":"ready"})).await?;
                 let transport = {
+                    ensure!(
+                        self.accepting.load(Ordering::Relaxed),
+                        "Connection selection changed"
+                    );
                     let mut inner = self.inner.lock().unwrap();
                     let peer = inner
                         .saved
@@ -410,7 +430,7 @@ impl Wireless {
                             video: pending.channels.remove("video").unwrap(),
                             camera: pending.channels.remove("camera").unwrap(),
                             adb: Adb::none(),
-                            simulated: true,
+                            kind: TransportKind::Wifi,
                         })
                     } else {
                         None
@@ -638,6 +658,19 @@ mod tests {
         let mut message = [0; 7];
         transport.control.read_exact(&mut message).await.unwrap();
         assert_eq!(&message, b"trusted");
+
+        // While the engine is using/recovering USB, reject competing Wi-Fi
+        // channels before Android is told the connection is ready.
+        wireless.set_accepting(false);
+        let mut competing = tls_client(&wireless).await;
+        write_json(&mut competing, &request("control"))
+            .await
+            .unwrap();
+        assert!(read_json(&mut competing).await.is_err());
+        wireless.set_accepting(true);
+        let mut resumed = tls_client(&wireless).await;
+        write_json(&mut resumed, &request("control")).await.unwrap();
+        assert_eq!(read_json(&mut resumed).await.unwrap()["kind"], "ready");
 
         wireless.forget(&sha256(token.as_bytes())).unwrap();
         assert!(Wireless::at(dir.path().into())

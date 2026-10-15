@@ -21,7 +21,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use xs_mutter::{CaptureSource, CursorMode, DisplayConfig};
 use xs_proto::{flags, Channel, ControlKind, Hello, TouchAction, TouchEvent, VideoConfig};
-use xs_transport::{FrameReader, FrameWriter, Socket, Transport, TransportHandle};
+use xs_transport::{
+    FrameReader, FrameWriter, ResumeAttempt, Socket, Transport, TransportHandle, TransportKind,
+};
 use xs_video::{VideoConfig as PipelineConfig, VideoPipeline};
 
 use crate::adaptive::{AdaptiveController, BitrateBounds, HealthSample};
@@ -198,13 +200,14 @@ impl Active {
     fn streaming_state(&self) -> State {
         State::Streaming {
             device: self.device_name.clone(),
+            connection: self.transport.connection_name().into(),
             width: self.width,
             height: self.height,
             encoder: self.encoder_name.clone(),
         }
     }
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self, stop_companion: bool) {
         // Stop the tasks first, so nothing is still pushing frames or injecting
         // input while the session underneath it disappears.
         for task in self.tasks.drain(..) {
@@ -214,7 +217,11 @@ impl Active {
             warn!(error = %e, "mutter session close");
         }
         self.pipeline.stop();
-        self.transport.disconnect().await;
+        if stop_companion {
+            self.transport.disconnect().await;
+        } else {
+            self.transport.release().await;
+        }
         info!("session stopped");
     }
 }
@@ -226,38 +233,77 @@ pub async fn run(
     wireless: Option<Arc<crate::Wireless>>,
 ) {
     let mut active: Option<Active> = None;
+    let mut recovery: Option<TransportHandle> = None;
+    let mut recovery_device_present = true;
+    let mut retry_after = tokio::time::Instant::now();
     let emit = |state: State| {
         let _ = events.send(Event::State(state));
     };
     emit(State::Idle);
 
-    let mut health = tokio::time::interval(Duration::from_secs(1));
+    let mut health = tokio::time::interval(Duration::from_millis(500));
     let mut accept_wireless = true;
     loop {
+        let allow_wifi = accept_wireless
+            && match active.as_ref().map(|a| &a.transport).or(recovery.as_ref()) {
+                Some(target) => match target.kind() {
+                    TransportKind::Adb => active.is_none() && !recovery_device_present,
+                    TransportKind::Wifi => true,
+                    TransportKind::Simulated => false,
+                },
+                None => true,
+            };
+        if let Some(wireless) = &wireless {
+            wireless.set_accepting(allow_wifi);
+        }
         let command = tokio::select! {
             command = commands.recv() => match command { Some(c) => c, None => break },
             incoming = async {
                 match &wireless { Some(w) => w.accept().await, None => std::future::pending().await }
             } => {
                 if let Some(transport) = incoming {
-                    if !accept_wireless { continue; }
+                    if !allow_wifi { continue; }
                     let peer_id = transport.device.serial.strip_prefix("wifi:");
                     if !wireless.as_ref().is_some_and(|w| w.paired_devices().iter().any(|p| Some(p.id.as_str()) == peer_id)) { continue; }
                     if let Some(current) = active.as_ref() {
                         if current.transport.device.serial != transport.device.serial { continue; }
                     }
-                    if let Some(current) = active.take() {
-                        current.shutdown().await;
-                        tokio::time::sleep(TEARDOWN_SETTLE).await;
+                    if let Some(target) = &recovery {
+                        if target.kind() == TransportKind::Wifi && target.device.serial != transport.device.serial { continue; }
                     }
+                    if let Some(current) = active.take() {
+                        current.shutdown(false).await;
+                        retry_after = tokio::time::Instant::now() + TEARDOWN_SETTLE;
+                    }
+                    if let Some(target) = recovery.take() { target.release().await; }
+                    tokio::time::sleep_until(retry_after).await;
                     active = try_connect_transport(&config, &events, Some(transport)).await;
                 }
                 continue;
             }
             _ = health.tick() => {
                 if active.as_ref().is_some_and(|a| !a.connected.load(Ordering::Relaxed)) {
-                    if let Some(current) = active.take() { current.shutdown().await; }
-                    emit(State::NoTablet);
+                    if let Some(current) = active.take() {
+                        recovery = Some(current.transport.clone());
+                        recovery_device_present = true;
+                        current.shutdown(false).await;
+                        retry_after = tokio::time::Instant::now() + TEARDOWN_SETTLE;
+                    }
+                    if let Some(target) = &recovery { emit(waiting_state(target)); }
+                }
+                if active.is_none() && accept_wireless && tokio::time::Instant::now() >= retry_after {
+                    if let Some(target) = recovery.as_ref().filter(|t| t.kind() != TransportKind::Wifi) {
+                        match tokio::time::timeout(Duration::from_secs(2), target.try_resume()).await {
+                            Ok(Ok(ResumeAttempt::Connected(transport))) => {
+                                active = try_connect_transport(&config, &events, Some(transport)).await;
+                                recovery = None;
+                            }
+                            Ok(Ok(ResumeAttempt::Waiting)) => recovery_device_present = true,
+                            Ok(Ok(ResumeAttempt::Unavailable)) => recovery_device_present = false,
+                            Ok(Err(error)) => debug!(%error, "waiting for original tablet connection"),
+                            Err(_) => debug!("original tablet connection probe timed out"),
+                        }
+                    }
                 }
                 continue;
             }
@@ -268,13 +314,22 @@ pub async fn run(
                 if active.is_some() {
                     continue;
                 }
+                if let Some(target) = recovery.take() {
+                    target.release().await;
+                }
+                if let Some(wireless) = &wireless {
+                    wireless.set_accepting(false);
+                }
                 active = try_connect(&config, &events).await;
             }
 
             Command::Disconnect => {
                 accept_wireless = false;
                 if let Some(session) = active.take() {
-                    session.shutdown().await;
+                    session.shutdown(true).await;
+                }
+                if let Some(target) = recovery.take() {
+                    target.release().await;
                 }
                 emit(State::Idle);
             }
@@ -286,18 +341,26 @@ pub async fn run(
             Command::SetScale(scale) => {
                 config.scale = clamp_ui_scale(scale);
                 if let Some(session) = active.take() {
-                    session.shutdown().await;
-                    tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    active = try_connect(&config, &events).await;
+                    recovery = Some(session.transport.clone());
+                    recovery_device_present = true;
+                    session.shutdown(false).await;
+                    retry_after = tokio::time::Instant::now() + TEARDOWN_SETTLE;
+                    if let Some(target) = &recovery {
+                        emit(waiting_state(target));
+                    }
                 }
             }
 
             Command::SetMode(mode) => {
                 config.mode = mode;
                 if let Some(session) = active.take() {
-                    session.shutdown().await;
-                    tokio::time::sleep(TEARDOWN_SETTLE).await;
-                    active = try_connect(&config, &events).await;
+                    recovery = Some(session.transport.clone());
+                    recovery_device_present = true;
+                    session.shutdown(false).await;
+                    retry_after = tokio::time::Instant::now() + TEARDOWN_SETTLE;
+                    if let Some(target) = &recovery {
+                        emit(waiting_state(target));
+                    }
                 }
             }
 
@@ -347,7 +410,10 @@ pub async fn run(
 
             Command::Shutdown => {
                 if let Some(session) = active.take() {
-                    session.shutdown().await;
+                    session.shutdown(true).await;
+                }
+                if let Some(target) = recovery.take() {
+                    target.release().await;
                 }
                 break;
             }
@@ -360,8 +426,15 @@ pub async fn run(
                                 .is_some_and(|a| a.transport.device.serial == format!("wifi:{id}"))
                             {
                                 if let Some(current) = active.take() {
-                                    current.shutdown().await;
+                                    current.shutdown(false).await;
                                 }
+                                emit(State::NoTablet);
+                            }
+                            if recovery
+                                .as_ref()
+                                .is_some_and(|t| t.device.serial == format!("wifi:{id}"))
+                            {
+                                recovery = None;
                                 emit(State::NoTablet);
                             }
                         }
@@ -374,7 +447,20 @@ pub async fn run(
             }
         }
     }
+    if let Some(session) = active {
+        session.shutdown(true).await;
+    }
+    if let Some(target) = recovery {
+        target.release().await;
+    }
     debug!("engine loop exited");
+}
+
+fn waiting_state(target: &TransportHandle) -> State {
+    State::WaitingForTablet {
+        device: target.device.display_name(),
+        connection: target.connection_name().into(),
+    }
 }
 
 /// Connects and reports the outcome, returning the session on success.

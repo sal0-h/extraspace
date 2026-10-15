@@ -33,7 +33,7 @@ pub enum Command {
     Connect,
     /// Tear everything down.
     Disconnect,
-    /// Change GNOME UI scale on the live virtual monitor. Does not recreate Meta-0.
+    /// Rebuild the display at a new scale, preserving the tablet and connection.
     SetScale(f64),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
@@ -52,7 +52,7 @@ pub enum Command {
 }
 
 /// Where the engine currently is. Drives what the UI shows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum State {
     /// Nothing running.
     Idle,
@@ -64,9 +64,12 @@ pub enum State {
     Unauthorized { device: String },
     /// Installing the companion app, forwarding ports, negotiating.
     Connecting { step: String },
+    /// An established connection was interrupted; resume it when its app returns.
+    WaitingForTablet { device: String, connection: String },
     /// Running.
     Streaming {
         device: String,
+        connection: String,
         width: u32,
         height: u32,
         encoder: String,
