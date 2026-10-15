@@ -35,7 +35,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
     private lateinit var textureView: TextureView
     private lateinit var statusView: TextView
     private lateinit var cursorOverlay: CursorOverlay
-    private var decoder: VideoDecoder? = null
+    @Volatile private var decoder: VideoDecoder? = null
     private var decoderSurface: Surface? = null
     private var connection: ConnectionManager? = null
     private var camera: CameraSource? = null
@@ -100,6 +100,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         decoder = VideoDecoder(decoderSurface!!)
         if (streamWidth > 0 && streamHeight > 0) {
             decoder?.start(streamWidth, streamHeight, null)
+            connection?.videoDecoderReady()
         }
         startConnection()
     }
@@ -143,7 +144,10 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
             streamHeight = height
             textureView.surfaceTexture?.setDefaultBufferSize(width, height)
             cursorOverlay.setStreamSize(width, height)
-            decoder?.start(width, height, null)
+            decoder?.let {
+                it.start(width, height, null)
+                connection?.videoDecoderReady()
+            }
             Log.i(TAG, "stream configured ${width}x$height @$framerate")
         }
     }

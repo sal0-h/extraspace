@@ -290,6 +290,28 @@ pub async fn run(
                 }
             }
 
+            Command::SaveVideoDiagnostic(directory) => {
+                let snapshot = active
+                    .as_ref()
+                    .and_then(|session| session.pipeline.diagnostic_snapshot());
+                let Some((frame, graph)) = snapshot else {
+                    warn!("no video keyframe available for a diagnostic");
+                    continue;
+                };
+                let saved_directory = directory.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::diagnostics::save(&directory, &frame, &graph)
+                })
+                .await
+                {
+                    Ok(Ok(())) => info!(
+                        directory = %saved_directory.display(),
+                        "saved video diagnostic"
+                    ),
+                    result => warn!(?result, "could not save video diagnostic"),
+                }
+            }
+
             Command::Shutdown => {
                 if let Some(session) = active.take() {
                     session.shutdown().await;

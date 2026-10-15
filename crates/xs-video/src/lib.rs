@@ -58,15 +58,11 @@ const RGB_COLORIMETRY: &str = "sRGB";
 
 /// BT.709 primaries, matrix and transfer, full (0–255) range.
 ///
-/// `vapostproc` defaults to limited-range NV12 — black encodes as Y=16, white as
-/// Y=235 — and `vah264lpenc` writes no VUI to say so. The tablet's TextureView
-/// is composited by SurfaceFlinger as `V0_SRGB` (full range), so those frames
-/// render washed-out: grey blacks, dull whites. Replugging rebuilds the decoder
-/// and sometimes the first path expands the range; after MediaCodec idles it
-/// often does not. Pinning full-range conversion makes the pixels match how the
-/// tablet actually displays them.
+/// Match the Android decoder's explicit full-range MediaFormat. Limited-range
+/// samples interpreted as full range lift blacks to 16 and dim whites to 235.
+/// Some VA encoders omit SPS color signaling, so both ends specify the range.
 ///
-/// GStreamer serialises this as `primaries:matrix:transfer:range` = `1:3:5:1`.
+/// GStreamer serialises this as `range:matrix:transfer:primaries` = `1:3:5:1`.
 const YUV_COLORIMETRY: &str = "1:3:5:1";
 
 /// Isolation stages for native-resolution budget work. Unset = production path.
@@ -260,6 +256,8 @@ pub struct VideoPipeline {
     encoder_element: gst::Element,
     encoder: Encoder,
     stats: Arc<VideoStats>,
+    /// One decodable frame retained for an explicitly requested color diagnostic.
+    diagnostic_keyframe: Arc<Mutex<Option<Bytes>>>,
     config: VideoConfig,
     capture_pace: Arc<StagePace>,
     rate_pace: Arc<StagePace>,
@@ -282,6 +280,7 @@ impl VideoPipeline {
 
         let encoder = select_encoder()?;
         let stats = Arc::new(VideoStats::default());
+        let diagnostic_keyframe = Arc::new(Mutex::new(None));
         let capture_pace = Arc::new(StagePace::new("capture"));
         let rate_pace = Arc::new(StagePace::new("videorate"));
         let encode_pace = Arc::new(StagePace::new("encoded"));
@@ -397,6 +396,7 @@ impl VideoPipeline {
 
                 let sink_stats = Arc::clone(&stats);
                 let sink_pace = Arc::clone(&encode_pace);
+                let sink_keyframe = Arc::clone(&diagnostic_keyframe);
                 appsink.set_callbacks(
                     gstreamer_app::AppSinkCallbacks::builder()
                         .new_sample(move |sink| {
@@ -411,6 +411,10 @@ impl VideoPipeline {
                                 pts_us,
                                 keyframe,
                             };
+                            if keyframe {
+                                *sink_keyframe.lock().expect("diagnostic frame lock") =
+                                    Some(frame.data.clone());
+                            }
                             sink_stats
                                 .bytes_encoded
                                 .fetch_add(au_bytes as u64, Ordering::Relaxed);
@@ -533,6 +537,7 @@ impl VideoPipeline {
                 encoder_element,
                 encoder,
                 stats,
+                diagnostic_keyframe,
                 config,
                 capture_pace,
                 rate_pace,
@@ -631,6 +636,16 @@ impl VideoPipeline {
 
     pub fn config(&self) -> &VideoConfig {
         &self.config
+    }
+
+    /// The latest keyframe includes SPS/PPS, so it can be decoded on its own.
+    /// No pixels are written to disk unless a diagnostic is explicitly requested.
+    pub fn diagnostic_snapshot(&self) -> Option<(Bytes, String)> {
+        let frame = self.diagnostic_keyframe.lock().ok()?.clone()?;
+        let graph = self
+            .pipeline
+            .debug_to_dot_data(gst::DebugGraphDetails::all());
+        Some((frame, graph.to_string()))
     }
 
     /// Logs asynchronous pipeline errors, which otherwise surface only as a

@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 
 pub mod adaptive;
+mod diagnostics;
 mod session;
 
 pub use adaptive::{AdaptiveController, BitrateBounds, HealthSample};
@@ -39,6 +40,8 @@ pub enum Command {
     SetBitrateBounds(BitrateBounds),
     /// Start or stop camera passthrough.
     SetCamera { enabled: bool, camera_id: String },
+    /// Save a decodable video frame and negotiated pipeline caps in a new directory.
+    SaveVideoDiagnostic(std::path::PathBuf),
     /// Shut the engine thread down.
     Shutdown,
 }

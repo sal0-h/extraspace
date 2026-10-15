@@ -20,7 +20,7 @@ import kotlin.concurrent.thread
  * starts to grow.
  */
 class VideoDecoder(private val surface: Surface) {
-    private var codec: MediaCodec? = null
+    @Volatile private var codec: MediaCodec? = null
     @Volatile private var running = false
     private var drainThread: Thread? = null
 
@@ -52,12 +52,8 @@ class VideoDecoder(private val surface: Surface) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1)
             }
-            // The host converts desktop sRGB to full-range BT.709 YUV. The VA
-            // encoder writes no VUI, so without these keys MediaCodec assumes
-            // limited range (16-235). TextureView is then composited as
-            // V0_SRGB / full range, and the picture goes washed-out. Pinning
-            // full range here stops the decoder from expanding values that are
-            // already 0-255.
+            // Match the host's full-range BT.709 conversion. Some VA encoders
+            // omit color signaling from the SPS, so supply the range explicitly.
             setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)

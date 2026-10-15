@@ -7,6 +7,9 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -14,8 +17,8 @@ import kotlin.concurrent.thread
  * Owns the three abstract unix sockets the host connects to.
  *
  * The tablet listens and the host connects, rather than the other way round. That
- * ordering means the app can be launched and simply wait, and it survives the host
- * reconnecting without needing the app to be restarted.
+ * ordering means the app can be launched and simply wait. The host starts a fresh
+ * activity when reconnecting so each socket belongs to one session.
  *
  * Each socket gets its own thread. They are almost entirely independent, and
  * keeping video off the same thread as control means a slow decode can never
@@ -43,10 +46,18 @@ class ConnectionManager(
     private var cameraServer: LocalServerSocket? = null
 
     private var controlSocket: LocalSocket? = null
+    @Volatile private var videoSocket: LocalSocket? = null
     private var cameraSocket: LocalSocket? = null
+
+    private val videoReady = CountDownLatch(1)
 
     @Volatile private var controlWriter: FrameWriter? = null
     @Volatile private var cameraWriter: FrameWriter? = null
+
+    /** Called after MediaCodec.start(), not just after receiving VIDEO_CONFIG. */
+    fun videoDecoderReady() {
+        videoReady.countDown()
+    }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -185,20 +196,30 @@ class ConnectionManager(
     // --------------------------------------------------------------- video
     private fun runVideo() {
         try {
-            val socket = videoServer!!.accept()
-            val reader = FrameReader(socket.inputStream)
-            // One reusable buffer: at 60fps, allocating per frame would keep the
-            // GC busy for no reason.
-            var buf = ByteArray(512 * 1024)
-            val recvPace = PaceWatch("recv")
+            videoServer!!.accept().use { socket ->
+                videoSocket = socket
+                // Control configuration runs on the main thread while video has its
+                // own socket. Keep the first access unit (including SPS/PPS) in the
+                // socket until the decoder exists instead of silently discarding it.
+                if (!videoReady.await(DECODER_START_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    throw IOException("video decoder did not become ready")
+                }
+                if (!running.get()) return
+                Log.i(TAG, "video delivery started after decoder became ready")
+                val reader = FrameReader(socket.inputStream)
+                // One reusable buffer: at 60fps, allocating per frame would keep the
+                // GC busy for no reason.
+                var buf = ByteArray(512 * 1024)
+                val recvPace = PaceWatch("recv")
 
-            while (running.get()) {
-                val header = reader.readHeader()
-                if (header.length > buf.size) buf = ByteArray(header.length.coerceAtLeast(buf.size * 2))
-                reader.readPayload(header, buf)
-                val isConfig = (header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt()) != 0
-                recvPace.observe("bytes=${header.length} pts_us=${header.ptsUs}")
-                callbacks.onVideoFrame(buf, header.length, header.ptsUs, isConfig)
+                while (running.get()) {
+                    val header = reader.readHeader()
+                    if (header.length > buf.size) buf = ByteArray(header.length.coerceAtLeast(buf.size * 2))
+                    reader.readPayload(header, buf)
+                    val isConfig = (header.flags.toInt() and Protocol.Flags.CODEC_CONFIG.toInt()) != 0
+                    recvPace.observe("bytes=${header.length} pts_us=${header.ptsUs}")
+                    callbacks.onVideoFrame(buf, header.length, header.ptsUs, isConfig)
+                }
             }
         } catch (e: Exception) {
             if (running.get()) {
@@ -238,7 +259,8 @@ class ConnectionManager(
 
     override fun close() {
         running.set(false)
-        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, cameraSocket)
+        videoReady.countDown()
+        listOf<Closeable?>(controlServer, videoServer, cameraServer, controlSocket, videoSocket, cameraSocket)
             .forEach { runCatching { it?.close() } }
         controlWriter = null
         cameraWriter = null
@@ -246,5 +268,6 @@ class ConnectionManager(
 
     private companion object {
         const val TAG = "extraspace"
+        const val DECODER_START_TIMEOUT_SECONDS = 5L
     }
 }

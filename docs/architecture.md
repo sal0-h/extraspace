@@ -67,6 +67,12 @@ frames instead of filling idle periods with duplicates. The Android decoder has
 a separate output-drain thread so the final frame can render even when no new
 input arrives.
 
+The video socket waits until `MediaCodec.start()` completes before delivering its
+first access unit. Control configuration is posted to Android's main thread;
+receiving `VideoConfig` on the control socket alone does not mean the decoder is
+ready. Losing the first SPS/PPS and keyframe can leave the decoder waiting for the
+next keyframe and inflate its reported queue depth.
+
 ## Scaling and compositor guards
 
 The default path divides the tablet panel dimensions by the selected scale,
@@ -99,3 +105,23 @@ not verify USB transport or Android's decoder.
 
 See the [engineering notes](engineering-notes.md) for earlier hardware results
 and the capture, encoder, and ADB behavior that motivated this design.
+
+## Live color diagnostics
+
+While the desktop app is running, this action saves its latest encoded keyframe
+and a graph containing the negotiated pipeline caps. It does not reconnect the
+tablet. Use a directory that does not already exist:
+
+```bash
+gdbus call --session \
+  --dest io.github.tymonoman.Extraspace \
+  --object-path /io/github/tymonoman/Extraspace \
+  --method org.gtk.Actions.Activate \
+  save-video-diagnostic "[<'/tmp/extraspace-video-sample'>]" '{}'
+
+ffprobe -v error -show_streams /tmp/extraspace-video-sample/frame.h264
+```
+
+The snapshot contains desktop pixels. The directory is private to your account,
+and files are only written when the action is requested. The saved frame is the
+latest keyframe, which may precede the request if the desktop has been idle.

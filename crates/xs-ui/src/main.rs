@@ -32,6 +32,19 @@ fn main() -> glib::ExitCode {
     app.connect_activate(|app| {
         let config = Rc::new(RefCell::new(Config::load()));
         let engine = xs_core::spawn(session_config(&config.borrow()));
+        let diagnostic = gtk::gio::SimpleAction::new(
+            "save-video-diagnostic",
+            Some(&String::static_variant_type()),
+        );
+        let diagnostic_engine = engine.clone();
+        diagnostic.connect_activate(move |_, parameter| {
+            if let Some(directory) = parameter.and_then(|value| value.str()) {
+                diagnostic_engine.send(xs_core::Command::SaveVideoDiagnostic(PathBuf::from(
+                    directory,
+                )));
+            }
+        });
+        app.add_action(&diagnostic);
         window::build(app, engine, config);
     });
 
@@ -54,7 +67,7 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
 
 /// Must match `versionCode` in `android/app/build.gradle.kts`; the host pushes a
 /// new APK whenever the tablet has an older one.
-const APK_VERSION: u32 = 8;
+const APK_VERSION: u32 = 9;
 
 /// Finds the companion APK.
 ///
