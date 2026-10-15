@@ -37,7 +37,7 @@ import androidx.core.view.WindowInsetsControllerCompat
  * A SurfaceView is a separate plane; on Samsung the decoder sits above any
  * in-window overlay, which made the pointer invisible.
  */
-class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, WirelessClient.Callbacks {
+class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
 
     private lateinit var textureView: TextureView
     private lateinit var statusView: TextView
@@ -49,12 +49,16 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
     private lateinit var wireless: WirelessClient
     private lateinit var pairingControls: View
     @Volatile private var connectionIsLive = false
-    private var connectionGeneration = 0
+    @Volatile private var connectionGeneration = 0
     private var destroyed = false
+    @Volatile private var foreground = false
+    private var wirelessGeneration = 0
+    private var pendingPairQr: String? = null
     private val main = Handler(Looper.getMainLooper())
     private val scanner = registerForActivityResult(ScanContract()) { result ->
         result.contents?.let { contents ->
-            runCatching { wireless.pairWithQr(contents) }.onFailure { showStatus(it.message) }
+            pendingPairQr = contents
+            submitPendingPairing()
         }
     }
 
@@ -64,6 +68,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
 
     private val statsTicker = object : Runnable {
         override fun run() {
+            if (!foreground || destroyed) return
             decoder?.let { d ->
                 connection?.sendStats(
                     d.queueDepth,
@@ -81,18 +86,14 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
         super.onCreate(savedInstanceState)
         DeviceInfo.load(this)
 
-        // A second monitor that sleeps is not a second monitor.
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         goFullscreen()
 
         setContentView(R.layout.activity_mirror)
         textureView = findViewById(R.id.surface)
         statusView = findViewById(R.id.status)
         pairingControls = findViewById(R.id.pairing_controls)
-        wireless = WirelessClient(this, this)
         findViewById<Button>(R.id.pair_computer).setOnClickListener { showPairingOptions() }
         findViewById<Button>(R.id.saved_computer).setOnClickListener { showSavedComputer() }
-        wireless.start()
         onBackPressedDispatcher.addCallback(this) { if (connectionIsLive) showSavedComputer() else finish() }
         textureView.isOpaque = true
         cursorOverlay = CursorOverlay(textureView, findViewById<ImageView>(R.id.cursor))
@@ -115,6 +116,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
     }
 
     private fun attachDecoder(surfaceTexture: SurfaceTexture) {
+        if (!foreground) return
         stopDecoder()
         if (streamWidth > 0 && streamHeight > 0) {
             surfaceTexture.setDefaultBufferSize(streamWidth, streamHeight)
@@ -136,7 +138,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
     }
 
     private fun startConnection() {
-        if (connection != null) return
+        if (!foreground || !::wireless.isInitialized || connection != null) return
         showStatus(wireless.computerName?.let { "Looking for $it…\n\nOpen Extraspace on your computer on the same Wi-Fi, or connect a USB cable." }
             ?: getString(R.string.waiting_for_host))
         connection = newConnection().also { it.start() }
@@ -154,7 +156,9 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
 
     /** Safe to call from any thread; hops to the main thread itself. */
     private fun showStatus(text: String?) {
+        val generation = connectionGeneration
         main.post {
+            if (destroyed || !foreground || generation != connectionGeneration) return@post
             statusView.text = text ?: ""
             statusView.visibility = if (text == null) View.GONE else View.VISIBLE
         }
@@ -164,23 +168,21 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
     // All of these arrive on socket threads, so anything touching a view or the
     // decoder is posted to the main thread.
     override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
-        main.post {
-            streamWidth = width
-            streamHeight = height
-            textureView.surfaceTexture?.setDefaultBufferSize(width, height)
-            cursorOverlay.setStreamSize(width, height)
-            decoder?.let {
-                it.start(width, height, null)
-                connection?.videoDecoderReady()
-            }
-            Log.i(TAG, "stream configured ${width}x$height @$framerate")
+        streamWidth = width
+        streamHeight = height
+        textureView.surfaceTexture?.setDefaultBufferSize(width, height)
+        cursorOverlay.setStreamSize(width, height)
+        decoder?.let {
+            it.start(width, height, null)
+            connection?.videoDecoderReady()
         }
+        Log.i(TAG, "stream configured ${width}x$height @$framerate")
     }
 
     override fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
         // Called on the video thread; MediaCodec is happy to be driven from here
         // and hopping to the main thread would only add latency.
-        if (decoder == null) return
+        if (!foreground || decoder == null) return
         if (streamWidth == 0) return
         decoder?.decode(data, length, ptsUs, isConfig)
         if (statusView.visibility == View.VISIBLE) showStatus(null)
@@ -189,34 +191,32 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
     override fun onCameraControl(
         enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int,
     ) {
-        main.post {
-            camera?.stop()
-            camera = if (enabled) {
-                CameraSource(this) { data, length, ptsUs, isConfig, isKey ->
-                    connection?.sendCameraFrame(data, length, ptsUs, isConfig, isKey)
-                }.also { it.start(cameraId, width, height, framerate, bitrateKbps) }
-            } else {
-                null
-            }
-        }
+        camera?.stop()
+        camera = if (enabled) {
+            CameraSource(this) { data, length, ptsUs, isConfig, isKey ->
+                connection?.sendCameraFrame(data, length, ptsUs, isConfig, isKey)
+            }.also { it.start(cameraId, width, height, framerate, bitrateKbps) }
+        } else { null }
     }
 
     override fun onCursor(update: CursorUpdate) {
-        cursorOverlay.submit(update)
+        if (foreground) cursorOverlay.submit(update)
     }
 
     override fun onConnected() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         connectionIsLive = true
         wireless.setStreaming(true)
-        main.post { pairingControls.visibility = View.GONE }
+        pairingControls.visibility = View.GONE
         showStatus(null)
     }
 
     override fun onDisconnected(reason: String) {
         // The generation guard dispatches this on the main thread. Invalidate
         // that generation now, before another channel can report the same loss.
-        if (destroyed) return
+        if (destroyed || !foreground) return
         Log.i(TAG, "connection ended; waiting for computer: $reason")
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         connectionGeneration++
         connectionIsLive = false
         connection?.close(); connection = null
@@ -228,31 +228,38 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
         wireless.setStreaming(false)
     }
 
-    override fun onWirelessStatus(message: String) { if (!connectionIsLive) showStatus(message) }
-
-    override fun onPaired(name: String) { showStatus("Paired with $name. Connecting…") }
-
-    override fun onWirelessConnected(channels: WirelessChannels) {
-        main.post {
-            if (destroyed || connectionIsLive) { channels.close(); return@post }
-            connection?.close(); connection = null
-            stopDecoder(); streamWidth = 0; streamHeight = 0
-            textureView.surfaceTexture?.let {
-                decoderSurface = Surface(it)
-                decoder = VideoDecoder(decoderSurface!!)
-            }
-            connection = newConnection(channels).also { it.start() }
+    private fun acceptWirelessChannels(channels: WirelessChannels) {
+        if (destroyed || !foreground || connectionIsLive) { channels.close(); return }
+        connection?.close(); connection = null
+        stopDecoder(); streamWidth = 0; streamHeight = 0
+        textureView.surfaceTexture?.let {
+            decoderSurface = Surface(it)
+            decoder = VideoDecoder(decoderSurface!!)
         }
+        connection = newConnection(channels).also { it.start() }
     }
 
     private fun newConnection(channels: WirelessChannels? = null): ConnectionManager {
         val generation = ++connectionGeneration
-        val guarded = object : ConnectionManager.Callbacks by this {
+        val guarded = object : ConnectionManager.Callbacks {
+            private fun current() = generation == connectionGeneration && foreground && !destroyed
             override fun onConnected() {
-                main.post { if (generation == connectionGeneration && !destroyed) this@MirrorActivity.onConnected() }
+                main.post { if (current()) this@MirrorActivity.onConnected() }
             }
             override fun onDisconnected(reason: String) {
-                main.post { if (generation == connectionGeneration && !destroyed) this@MirrorActivity.onDisconnected(reason) }
+                main.post { if (current()) this@MirrorActivity.onDisconnected(reason) }
+            }
+            override fun onVideoConfig(width: Int, height: Int, framerate: Int) {
+                main.post { if (current()) this@MirrorActivity.onVideoConfig(width, height, framerate) }
+            }
+            override fun onVideoFrame(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean) {
+                if (current()) this@MirrorActivity.onVideoFrame(data, length, ptsUs, isConfig)
+            }
+            override fun onCameraControl(enabled: Boolean, cameraId: String, width: Int, height: Int, framerate: Int, bitrateKbps: Int) {
+                main.post { if (current()) this@MirrorActivity.onCameraControl(enabled, cameraId, width, height, framerate, bitrateKbps) }
+            }
+            override fun onCursor(update: CursorUpdate) {
+                if (current()) this@MirrorActivity.onCursor(update)
             }
         }
         return ConnectionManager(guarded, channels)
@@ -294,6 +301,7 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
             .setMessage(if (name == null) "Choose Pair computer to save a computer for automatic connection."
                 else "Extraspace connects to this computer automatically. Forget it to remove its saved permission.")
             .setNegativeButton("Close", null)
+            .setNeutralButton("Close Extraspace") { _, _ -> finish() }
         if (name != null) dialog.setPositiveButton("Forget computer") { _, _ ->
             connectionGeneration++
             connection?.close(); connection = null; connectionIsLive = false
@@ -363,13 +371,67 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks, Wireles
         if (hasFocus) goFullscreen()
     }
 
+    override fun onStart() {
+        super.onStart()
+        foreground = true
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val generation = ++wirelessGeneration
+        wireless = WirelessClient(this, object : WirelessClient.Callbacks {
+            override fun onWirelessStatus(message: String) {
+                main.post {
+                    if (foreground && generation == wirelessGeneration && !connectionIsLive) showStatus(message)
+                }
+            }
+            override fun onPaired(name: String) {
+                main.post {
+                    if (foreground && generation == wirelessGeneration) showStatus("Paired with $name. Connecting…")
+                }
+            }
+            override fun onWirelessConnected(channels: WirelessChannels) {
+                main.post {
+                    if (foreground && generation == wirelessGeneration && !destroyed) acceptWirelessChannels(channels)
+                    else channels.close()
+                }
+            }
+        })
+        wireless.start()
+        textureView.surfaceTexture?.let { attachDecoder(it) }
+        submitPendingPairing()
+        Log.i(TAG, "app visible; connections enabled")
+    }
+
+    private fun submitPendingPairing() {
+        if (!foreground || !::wireless.isInitialized) return
+        val contents = pendingPairQr ?: return
+        pendingPairQr = null
+        runCatching { wireless.pairWithQr(contents) }.onFailure { showStatus(it.message) }
+    }
+
+    override fun onStop() {
+        stopForegroundSession()
+        super.onStop()
+    }
+
+    private fun stopForegroundSession() {
+        foreground = false
+        wirelessGeneration++
+        connectionGeneration++
+        main.removeCallbacks(statsTicker)
+        if (::wireless.isInitialized) wireless.close()
+        connection?.close(); connection = null
+        camera?.stop(); camera = null
+        stopDecoder()
+        streamWidth = 0; streamHeight = 0
+        connectionIsLive = false
+        cursorOverlay.hide()
+        pairingControls.visibility = View.VISIBLE
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Log.i(TAG, "app hidden; discovery, sockets, decoder and camera stopped")
+    }
+
     override fun onDestroy() {
         destroyed = true
-        wireless.close()
-        main.removeCallbacks(statsTicker)
-        camera?.stop()
-        connection?.close()
-        stopDecoder()
+        stopForegroundSession()
         cursorOverlay.detach()
         super.onDestroy()
     }

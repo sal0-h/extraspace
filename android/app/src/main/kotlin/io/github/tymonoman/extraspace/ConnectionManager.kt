@@ -15,6 +15,9 @@ import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.RejectedExecutionException
 import kotlin.concurrent.thread
 
 /**
@@ -48,6 +51,10 @@ class ConnectionManager(
     private val running = AtomicBoolean(false)
     private val ended = AtomicBoolean(false)
     private val lifecycle = Any()
+    private val controlOutput = ThreadPoolExecutor(
+        1, 1, 0, TimeUnit.SECONDS, ArrayBlockingQueue<Runnable>(256),
+        { task -> Thread(task, "xs-control-out") }, ThreadPoolExecutor.AbortPolicy(),
+    )
     private var controlServer: LocalServerSocket? = null
     private var videoServer: LocalServerSocket? = null
     private var cameraServer: LocalServerSocket? = null
@@ -208,20 +215,18 @@ class ConnectionManager(
 
     /** Sends a touch event. Cheap enough to call straight from the input thread. */
     fun sendTouch(event: TouchEvent) {
-        val writer = controlWriter ?: return
-        try {
+        val ptsUs = System.nanoTime() / 1000
+        enqueueControl { writer ->
             writer.write(
                 Protocol.Channel.TOUCH, 0, 0,
-                System.nanoTime() / 1000, event.encode(),
+                ptsUs, event.encode(),
             )
-        } catch (e: Exception) {
-            Log.w(TAG, "could not send touch", e)
         }
     }
 
     /** Periodic health report that drives the host's adaptive bitrate controller. */
     fun sendStats(queueDepth: Int, decoded: Long, dropped: Long, lastPtsUs: Long, renderedAtUs: Long) {
-        val writer = controlWriter ?: return
+        if (controlWriter == null) return
         val json = JSONObject().apply {
             put("decode_queue_depth", queueDepth)
             put("frames_decoded", decoded)
@@ -229,13 +234,25 @@ class ConnectionManager(
             put("last_frame_pts_us", lastPtsUs)
             put("rendered_at_us", renderedAtUs)
         }
-        try {
+        enqueueControl { writer ->
             writer.write(
                 Protocol.Channel.CONTROL, Protocol.ControlKind.STATS,
                 0, System.nanoTime() / 1000, json.toString().toByteArray(),
             )
-        } catch (e: Exception) {
-            Log.w(TAG, "could not send stats", e)
+        }
+    }
+
+    private fun enqueueControl(send: (FrameWriter) -> Unit) {
+        if (!running.get() || controlWriter == null) return
+        try {
+            controlOutput.execute {
+                if (!running.get()) return@execute
+                val writer = controlWriter ?: return@execute
+                try { send(writer) }
+                catch (e: Exception) { reportDisconnected(e.message ?: "control channel closed") }
+            }
+        } catch (_: RejectedExecutionException) {
+            reportDisconnected("Connection is not keeping up")
         }
     }
 
@@ -305,6 +322,7 @@ class ConnectionManager(
 
     override fun close() {
         running.set(false)
+        controlOutput.shutdownNow()
         videoReady.countDown()
         synchronized(lifecycle) { closeListeners() }
         listOf<Closeable?>(controlSocket, videoSocket, cameraSocket, wireless)

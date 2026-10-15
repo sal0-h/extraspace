@@ -158,6 +158,11 @@ can be used once.
 
 After pairing, opening both apps reconnects automatically. No IP addresses,
 terminal commands, Android Wireless debugging, or repeat pairing are needed.
+Wi-Fi discovery and streaming run only while the tablet app is visible. Going
+Home or switching to another app stops them; returning reconnects automatically.
+The screen stays awake while streaming and follows its usual timeout while
+waiting. Saved pairing keys do not require a background service.
+
 Trust remains saved across app and computer restarts. Choose **Paired devices >
 Forget** on the computer or **Saved computer > Forget computer** on the tablet to
 revoke it. While streaming, Android's Back gesture opens the saved computer

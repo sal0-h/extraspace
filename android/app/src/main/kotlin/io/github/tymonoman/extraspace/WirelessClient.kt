@@ -48,6 +48,7 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
     private val discovered = ConcurrentHashMap<String, Endpoint>()
     private val services = ConcurrentHashMap<String, NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
+    private val socketLifecycle = Any()
     private val preferences = app.getSharedPreferences("wireless", Context.MODE_PRIVATE)
     @Volatile private var request: PairRequest? = null
     @Volatile private var paired: JSONObject? = load()
@@ -158,6 +159,7 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
             try {
                 val session = randomHex(16)
                 for (channel in listOf("control", "video", "camera")) {
+                    if (!running.get() || streaming || paired !== credential) throw IOException("Connection cancelled")
                     val socket = tls(endpoint, credential.getString("fingerprint"))
                     activeSocket = socket; sockets.add(socket)
                     write(socket, JSONObject().put("kind", "channel").put("channel", channel)
@@ -191,7 +193,7 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
     @Suppress("DEPRECATION")
     private fun resolve(info: NsdServiceInfo) {
         if (!running.get() || !resolving.compareAndSet(false, true)) return
-        nsd.resolveService(info, object : NsdManager.ResolveListener {
+        runCatching { nsd.resolveService(info, object : NsdManager.ResolveListener {
             override fun onResolveFailed(service: NsdServiceInfo, code: Int) { resolving.set(false) }
             override fun onServiceResolved(service: NsdServiceInfo) {
                 resolving.set(false)
@@ -199,7 +201,7 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
                 val host = service.host?.hostAddress ?: return
                 if (id.matches(Regex("[0-9a-f]{64}"))) discovered[id] = Endpoint(host, service.port)
             }
-        })
+        }) }.onFailure { resolving.set(false) }
     }
 
     private fun tls(endpoint: Endpoint, pin: String?): SSLSocket {
@@ -218,7 +220,10 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
         try {
             socket.enabledProtocols = arrayOf("TLSv1.3")
             socket.soTimeout = 5000; socket.tcpNoDelay = true
-            activeSocket = socket
+            synchronized(socketLifecycle) {
+                if (!running.get()) throw IOException("App is no longer visible")
+                activeSocket = socket
+            }
             socket.connect(InetSocketAddress(endpoint.host, endpoint.port), 2500)
             socket.startHandshake()
             return socket
@@ -254,7 +259,7 @@ class WirelessClient(context: Context, private val callbacks: Callbacks) : Close
         running.set(false); request = null
         runCatching { nsd.stopServiceDiscovery(discovery) }
         runCatching { multicast?.release() }
-        runCatching { activeSocket?.close() }
+        synchronized(socketLifecycle) { runCatching { activeSocket?.close() } }
         worker?.interrupt()
     }
 

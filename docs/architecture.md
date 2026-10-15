@@ -173,3 +173,23 @@ window, and each connection reports a disconnect only once. Session-generation
 guards discard stale callbacks so simultaneous channel closures cannot tear
 down a new connection. The desktop detects a lost control channel and returns
 to its waiting screen while the Android client retries automatically.
+
+Android connection resources follow the visible activity lifecycle. `onStart`
+creates a fresh discovery client and resumes the local listeners; `onStop`
+closes discovery and in-flight TLS attempts, releases the multicast lock, closes
+all channels, stops the decoder and camera, and removes the statistics timer.
+Saved credentials remain encrypted on disk. Generation guards reject callbacks
+from a previous visible session, including a connection completing after Home.
+The QR scanner is a separate activity: its result is queued until the display
+activity starts again. The display keeps the screen awake only while connected;
+waiting uses the normal Android timeout. USB's explicit ADB activity launch is
+independent of these resources and does not require a resident app listener.
+
+Live foreground/background checks on the SM-X510 covered two Home/return
+cycles in the same process: Home left no `xs-*` worker threads, released the
+`extraspace-discovery` multicast lock and closed the three TLS channels.
+Opening the desktop app over native Wi-Fi while the tablet app remained hidden
+did not wake it. Returning to the tablet app restored all three channels without
+pairing again. Touch and health-report writes use a bounded control-output
+worker, rather than performing TLS writes on Android's main thread; that worker
+is also stopped when the activity is hidden.

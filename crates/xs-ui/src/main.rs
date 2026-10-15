@@ -72,7 +72,7 @@ fn session_config(config: &Config) -> xs_core::SessionConfig {
 
 /// Must match `versionCode` in `android/app/build.gradle.kts`; the host pushes a
 /// new APK whenever the tablet has an older one.
-const APK_VERSION: u32 = 11;
+const APK_VERSION: u32 = 12;
 
 /// Finds the companion APK.
 ///
