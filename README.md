@@ -151,24 +151,28 @@ the default path until the patched build is restored.
 
 ## Experimental Wi-Fi connection
 
-Extraspace can carry the screen stream over Android's secure wireless debugging
-connection. Pair the computer in **Settings > Developer options > Wireless
-debugging > Pair device with pairing code**, then connect using the device IP
-and connection port shown on the Wireless debugging screen:
+Pair the computer once in **Settings > Developer options > Wireless debugging >
+Pair device with pairing code**. Accept the prompt to always allow debugging on
+your Wi-Fi network. The desktop launcher then looks for the paired wireless
+device and prefers it when available; USB remains the fallback. Android's
+wireless debugging toggle must be on, and the tablet and computer must be on the
+same trusted network. The launcher uses the Android SDK ADB client when present
+so it can discover the connection through mDNS. It waits briefly for discovery
+before opening the app.
+
+If you need to choose the connection manually while USB is also attached, first
+connect using the IP address and connection port shown on the tablet:
 
 ```bash
-adb pair TABLET_IP:PAIRING_PORT
 adb connect TABLET_IP:CONNECTION_PORT
 adb devices
 ANDROID_SERIAL=TABLET_IP:CONNECTION_PORT extraspace
 ```
 
-The pairing port and connection port are different. `ANDROID_SERIAL` selects the
-Wi-Fi connection when USB is also attached; without it, Extraspace uses the
-first ready ADB device. Wi-Fi performance depends on the network. In a short
-comparison at 1536×960 and 60 Hz, Wi-Fi held the average frame rate but showed
-more frame-timing spikes and higher round-trip latency than USB. See the
-[wireless comparison](docs/wireless-benchmark.md).
+The pairing port and connection port are different. Wi-Fi performance depends
+on the network. In a short comparison at 1536×960 and 60 Hz, Wi-Fi held the
+average frame rate but showed more frame-timing spikes and higher round-trip
+latency than USB. See the [wireless comparison](docs/wireless-benchmark.md).
 
 ## Troubleshooting
 

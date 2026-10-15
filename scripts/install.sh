@@ -25,6 +25,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 if [[ "${1:-}" == "--uninstall" ]]; then
   bold "Uninstalling Extraspace"
   rm -f "$BIN_DIR/$BIN_NAME" && ok "removed $BIN_DIR/$BIN_NAME"
+  rm -f "$BIN_DIR/extraspace-launcher" && ok "removed desktop launcher helper"
   rm -f "$DESKTOP_DIR/$APP_ID.desktop" && ok "removed desktop entry"
   rm -f "$HOME/.config/autostart/$APP_ID.desktop" && ok "removed autostart"
   rm -f "$ICON_DIR/$APP_ID.svg" && ok "removed icon"
@@ -54,6 +55,8 @@ fi
 mkdir -p "$BIN_DIR"
 install -m755 "$BINARY" "$BIN_DIR/$BIN_NAME"
 ok "installed $BIN_DIR/$BIN_NAME"
+install -m755 "$REPO_ROOT/scripts/launch-desktop.sh" "$BIN_DIR/extraspace-launcher"
+ok "installed wireless-aware desktop launcher"
 
 # --- companion APK -----------------------------------------------------------
 # Desktop launches start with cwd=$HOME, so the relative android/ tree in the
@@ -95,7 +98,7 @@ Type=Application
 Name=Extraspace
 GenericName=Tablet Display
 Comment=Use an Android tablet as an extra display and webcam
-Exec=$BIN_DIR/$BIN_NAME
+Exec=$BIN_DIR/extraspace-launcher
 Icon=$APP_ID
 Terminal=false
 Categories=Utility;GTK;GNOME;
