@@ -32,6 +32,7 @@ struct Widgets {
     toasts: adw::ToastOverlay,
 
     display_switch: adw::SwitchRow,
+    display_switch_handler: RefCell<Option<glib::SignalHandlerId>>,
     mode_row: adw::ComboRow,
     scale_row: adw::ComboRow,
     camera_switch: adw::SwitchRow,
@@ -103,6 +104,15 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
         gtk::gio::SimpleAction::new_stateful("session-state", None, &"\"Idle\"".to_variant());
     session_state.set_enabled(false);
     app.add_action(&session_state);
+    let set_display =
+        gtk::gio::SimpleAction::new("set-display", Some(&bool::static_variant_type()));
+    let display_switch = widgets.display_switch.clone();
+    set_display.connect_activate(move |_, parameter| {
+        if let Some(enabled) = parameter.and_then(|p| p.get::<bool>()) {
+            display_switch.set_active(enabled);
+        }
+    });
+    app.add_action(&set_display);
     let set_scale = gtk::gio::SimpleAction::new("set-scale", Some(&f64::static_variant_type()));
     let scale_row = widgets.scale_row.clone();
     set_scale.connect_activate(move |_, parameter| {
@@ -260,6 +270,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         window_title,
         toasts,
         display_switch,
+        display_switch_handler: RefCell::new(None),
         mode_row,
         scale_row,
         camera_switch,
@@ -328,19 +339,19 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
                 0
             });
         widgets.camera_switch.set_active(c.camera_enabled);
-        widgets.display_switch.set_active(true);
     }
     update_scale_subtitle(widgets, config);
 
     {
         let engine = engine.clone();
-        widgets.display_switch.connect_active_notify(move |row| {
+        let handler = widgets.display_switch.connect_active_notify(move |row| {
             engine.send(if row.is_active() {
                 Command::Connect
             } else {
                 Command::Disconnect
             });
         });
+        widgets.display_switch_handler.replace(Some(handler));
     }
 
     {
@@ -453,6 +464,22 @@ fn listen_to_engine(
 }
 
 fn apply_state(widgets: &Rc<Widgets>, state: &State) {
+    // Automatic Wi-Fi connections and the status-page Connect button bypass
+    // the switch. Render the engine's state without echoing a new command.
+    let enabled = matches!(
+        state,
+        State::Connecting { .. } | State::WaitingForTablet { .. } | State::Streaming { .. }
+    );
+    {
+        let handler = widgets.display_switch_handler.borrow();
+        if let Some(handler) = handler.as_ref() {
+            widgets.display_switch.block_signal(handler);
+        }
+        widgets.display_switch.set_active(enabled);
+        if let Some(handler) = handler.as_ref() {
+            widgets.display_switch.unblock_signal(handler);
+        }
+    }
     let show_status = |icon: &str, title: &str, description: &str, button: Option<&str>| {
         widgets.status.set_icon_name(Some(icon));
         widgets.status.set_title(title);
@@ -579,4 +606,68 @@ fn apply_stats(widgets: &Rc<Widgets>, stats: &Stats) {
         "measuring…".to_owned()
     };
     widgets.stat_latency.set_subtitle(&latency);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_connections_sync_the_display_switch_without_sending_commands() {
+        adw::init().expect("run GTK tests under xvfb-run when no display is available");
+        let (_page, widgets) = build_content(adw::WindowTitle::new("Extraspace", ""));
+        let widgets = Rc::new(widgets);
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let sent = Rc::clone(&commands);
+        let handler = widgets.display_switch.connect_active_notify(move |row| {
+            sent.borrow_mut().push(row.is_active());
+        });
+        widgets.display_switch_handler.replace(Some(handler));
+
+        let streaming = State::Streaming {
+            device: "Tablet".into(),
+            connection: "Wi-Fi".into(),
+            width: 1536,
+            height: 960,
+            encoder: "test".into(),
+        };
+        apply_state(&widgets, &streaming);
+        assert!(widgets.display_switch.is_active());
+        assert_eq!(
+            widgets.stack.visible_child_name().as_deref(),
+            Some("running")
+        );
+        assert!(commands.borrow().is_empty());
+
+        // Off must still send the user's disconnect request. The engine can
+        // then report Idle, followed by a later automatic Wi-Fi connection.
+        widgets.display_switch.set_active(false);
+        assert_eq!(*commands.borrow(), vec![false]);
+        for state in [
+            State::Idle,
+            State::NoTablet,
+            State::Failed {
+                message: "Connection lost".into(),
+            },
+            streaming,
+            State::WaitingForTablet {
+                device: "Tablet".into(),
+                connection: "Wi-Fi".into(),
+            },
+            State::Connecting {
+                step: "Reconnecting".into(),
+            },
+        ] {
+            apply_state(&widgets, &state);
+            let enabled = matches!(
+                state,
+                State::Streaming { .. } | State::WaitingForTablet { .. } | State::Connecting { .. }
+            );
+            assert_eq!(widgets.display_switch.is_active(), enabled, "{state:?}");
+            assert_eq!(*commands.borrow(), vec![false]);
+        }
+        apply_state(&widgets, &State::Idle);
+        widgets.display_switch.set_active(true);
+        assert_eq!(*commands.borrow(), vec![false, true]);
+    }
 }

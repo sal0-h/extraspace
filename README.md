@@ -219,7 +219,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-The unit tests run without a tablet or an active GNOME session. For architecture,
+The unit tests run without a tablet or an active GNOME session. GTK tests need a
+display; on a headless machine use `GSETTINGS_BACKEND=memory xvfb-run -a cargo test --workspace --locked`
+with Xvfb and xauth installed. For architecture,
 crate responsibilities, and manual integration checks, see
 [architecture](docs/architecture.md) and [contributing](CONTRIBUTING.md).
 

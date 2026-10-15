@@ -37,7 +37,10 @@ for script in scripts/*.sh packaging/mutter-patch/*.sh \
 done
 ```
 
-Unit tests need no tablet or GNOME session. The manual capture and simulated
+Unit tests need no tablet or GNOME session. GTK tests need a display; on a
+headless machine install Xvfb and xauth, then run
+`GSETTINGS_BACKEND=memory xvfb-run -a cargo test --workspace --locked`.
+The manual capture and simulated
 tablet examples require GNOME on Wayland; see
 [integration examples](docs/architecture.md#integration-examples).
 

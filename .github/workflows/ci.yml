@@ -31,7 +31,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
-            libpipewire-0.3-dev
+            libpipewire-0.3-dev xvfb xauth
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -46,9 +46,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked
 
       - name: Tests
-        # The unit tests are deliberately hardware-free: protocol, adaptive
-        # control, scaling maths and config all run on a bare runner.
-        run: cargo test --workspace --locked
+        # GTK state tests use a virtual display; no tablet or compositor needed.
+        run: GSETTINGS_BACKEND=memory xvfb-run -a cargo test --workspace --locked
 
       - name: Build
         run: cargo build --release --locked
