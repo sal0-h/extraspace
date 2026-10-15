@@ -9,7 +9,7 @@ pkgname=(
   mutter-devkit
   mutter-docs
 )
-pkgver=50.5
+pkgver=51.0
 pkgrel=2
 pkgdesc="Window manager and compositor for GNOME"
 url="https://gitlab.gnome.org/GNOME/mutter"
@@ -91,10 +91,10 @@ source=(
   0001-virtual-monitor-guard-unconfigured-crtc.patch
   0002-virtual-monitor-skip-null-stage-view.patch
 )
-b2sums=('1809a54d355194538db6128a91867799dc96c191e761c39e9952b54ace0868648dd62459f7eb047c21bc51e03377336563bdfc53876197ae53e0a74e94cd18c3'
+b2sums=('3c7e7159e70b09b91325335c4d13bb0ff51a161e430a0a63c65f380d5d31927cc8812cfb32b38b4964741c65c34ba12decc81274c7f556e7225d4255778689d8'
         'f989bc2ceb52aad3c6a23c439df3bbc672bc11d561a247d19971d30cc85ed5d42295de40f8e55b13404ed32aa44f12307c9f5b470f2e288d1c9c8329255c43bf'
-        '6745903ff85aa2b797e11a2546e4f95539f4a1ccf945c43357c89fdf44bf95267d75bee318cf69ba76846ed59d9a359fbdb4958cf7448cd47cbf44543a50c0c1'
-        '69ba3779cfb2e374e8e3cb94a6046821072dfd421f25252ffe9afa579b25643c03b78941d10da172d4e1f72d815b9986aa2793b5490533ffcca8e92dc6cfea48')
+        '738b39fee783862b033c5a61cef433091bd0996471bd389e8cde864e7bab3b371e1a1b25cb43d56ec90883fb522d929e89308de6e390cb7e2613e604ee355183'
+        '891390f004279bf067ddd2cc99079f6d3bffb55b28d1c08e901bb6af33d67dfc4ce757f1a083ab0dc08ae2c77872e0106c0fa18f6044d30d1cb0c5f2b724b237')
 
 prepare() {
   cd mutter
@@ -111,10 +111,8 @@ prepare() {
 build() {
   local meson_options=(
     -D docs=true
-    -D egl_device=true
     -D installed_tests=false
     -D tests=disabled
-    -D wayland_eglstream=true
   )
 
   CFLAGS="${CFLAGS/-O2/-O3} -fno-semantic-interposition"
@@ -138,13 +136,13 @@ _pick() {
 }
 
 package_mutter() {
-  provides=(libmutter-18.so)
+  provides=(libmutter-51.so)
   optdepends=(
     'bash-completion: Bash completions for gdctl'
     'mutter-devkit: Mutter SDK, "MDK"'
   )
 
-  meson install -C build --destdir "$pkgdir"
+  meson install -C build --no-rebuild --destdir "$pkgdir"
 
   _pick devkit "$pkgdir"/usr/lib/mutter-devkit
   _pick devkit "$pkgdir"/usr/share/applications/org.gnome.Mutter.Mdk.desktop

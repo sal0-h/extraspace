@@ -1,10 +1,10 @@
 #!/bin/sh
-# Builds mutter 50.5-2 (50.5 plus the ExtraSpace virtual-monitor crash guards)
+# Builds mutter 51.0-2 (51.0 plus the ExtraSpace virtual-monitor crash guards)
 # and installs it.
 #
 # Needs sudo twice: once for makepkg to pull in build dependencies, once for
 # pacman to install the result. Nothing else on the system is touched -- the
-# soname stays libmutter-18.so=0-64, so gnome-shell does not need rebuilding.
+# soname stays libmutter-51.so, matching gnome-shell 51.
 #
 # The new library is only picked up by a freshly started compositor, so log out
 # and back in afterwards.

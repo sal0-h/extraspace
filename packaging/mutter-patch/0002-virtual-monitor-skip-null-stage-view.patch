@@ -1,8 +1,8 @@
-diff --git a/src/backends/meta-screen-cast-virtual-stream-src.c b/src/backends/meta-screen-cast-virtual-stream-src.c
-index 7c31b0b..6906c58 100644
---- a/src/backends/meta-screen-cast-virtual-stream-src.c
-+++ b/src/backends/meta-screen-cast-virtual-stream-src.c
-@@ -26,6 +26,7 @@
+diff --git a/src/backends/meta-stream-source-virtual.c b/src/backends/meta-stream-source-virtual.c
+index 89ff908f65..03114bb423 100644
+--- a/src/backends/meta-stream-source-virtual.c
++++ b/src/backends/meta-stream-source-virtual.c
+@@ -22,6 +22,7 @@
  
  #include <spa/param/video/format-utils.h>
  #include <spa/buffer/meta.h>
@@ -10,14 +10,14 @@ index 7c31b0b..6906c58 100644
  
  #include "backends/meta-crtc-mode.h"
  #include "backends/meta-cursor-tracker-private.h"
-@@ -198,7 +199,13 @@ static void
- pointer_position_invalidated (MetaCursorTracker       *cursor_tracker,
-                               MetaScreenCastStreamSrc *src)
+@@ -168,7 +169,13 @@ static void
+ pointer_position_invalidated (MetaCursorTracker *cursor_tracker,
+                               MetaStreamSource  *source)
  {
--  clutter_stage_view_schedule_update (view_from_src (src));
+-  clutter_stage_view_schedule_update (view_from_source (source));
 +  ClutterStageView *view;
 +
-+  view = view_from_src (src);
++  view = view_from_source (source);
 +  if (!view)
 +    return;
 +
@@ -25,16 +25,16 @@ index 7c31b0b..6906c58 100644
  }
  
  static void
-@@ -206,10 +213,15 @@ cursor_changed (MetaCursorTracker              *cursor_tracker,
-                 MetaScreenCastVirtualStreamSrc *virtual_src)
+@@ -176,10 +183,15 @@ cursor_changed (MetaCursorTracker       *cursor_tracker,
+                 MetaStreamSourceVirtual *source_virtual)
  {
-   MetaScreenCastStreamSrc *src = META_SCREEN_CAST_STREAM_SRC (virtual_src);
+   MetaStreamSource *source = META_STREAM_SOURCE (source_virtual);
 +  ClutterStageView *view;
  
-   virtual_src->cursor_bitmap_invalid = TRUE;
+   source_virtual->cursor_bitmap_invalid = TRUE;
  
--  clutter_stage_view_schedule_update (view_from_src (src));
-+  view = view_from_src (src);
+-  clutter_stage_view_schedule_update (view_from_source (source));
++  view = view_from_source (source);
 +  if (!view)
 +    return;
 +
@@ -42,44 +42,44 @@ index 7c31b0b..6906c58 100644
  }
  
  static void
-@@ -287,6 +299,7 @@ setup_view (MetaScreenCastVirtualStreamSrc *virtual_src,
-   MetaScreenCastStream *stream = meta_screen_cast_stream_src_get_stream (src);
-   MetaStage *meta_stage = META_STAGE (stage_from_src (src));
+@@ -257,6 +269,7 @@ setup_view (MetaStreamSourceVirtual *source_virtual,
+   MetaStream *stream = meta_stream_source_get_stream (source);
+   MetaStage *meta_stage = META_STAGE (stage_from_source (source));
  
 +  g_return_if_fail (CLUTTER_IS_STAGE_VIEW (view));
-   g_return_if_fail (!virtual_src->paint_watch &&
-                     !virtual_src->skipped_watch);
+   g_return_if_fail (!source_virtual->paint_watch &&
+                     !source_virtual->skipped_watch);
  
-@@ -334,13 +347,20 @@ on_monitors_changed (MetaMonitorManager             *monitor_manager,
+@@ -304,13 +317,20 @@ on_monitors_changed (MetaMonitorManager      *monitor_manager,
  
-   if (meta_screen_cast_stream_src_is_enabled (src))
+   if (meta_stream_source_is_enabled (source))
      {
--      meta_stage_remove_watch (stage, virtual_src->paint_watch);
--      virtual_src->paint_watch = NULL;
--      meta_stage_remove_watch (stage, virtual_src->skipped_watch);
--      virtual_src->skipped_watch = NULL;
-+      if (virtual_src->paint_watch)
+-      meta_stage_remove_watch (stage, source_virtual->paint_watch);
+-      source_virtual->paint_watch = NULL;
+-      meta_stage_remove_watch (stage, source_virtual->skipped_watch);
+-      source_virtual->skipped_watch = NULL;
++      if (source_virtual->paint_watch)
 +        {
-+          meta_stage_remove_watch (stage, virtual_src->paint_watch);
-+          virtual_src->paint_watch = NULL;
++          meta_stage_remove_watch (stage, source_virtual->paint_watch);
++          source_virtual->paint_watch = NULL;
 +        }
-+      if (virtual_src->skipped_watch)
++      if (source_virtual->skipped_watch)
 +        {
-+          meta_stage_remove_watch (stage, virtual_src->skipped_watch);
-+          virtual_src->skipped_watch = NULL;
++          meta_stage_remove_watch (stage, source_virtual->skipped_watch);
++          source_virtual->skipped_watch = NULL;
 +        }
  
-       view = view_from_src (src);
--      setup_view (virtual_src, view);
+       view = view_from_source (source);
+-      setup_view (source_virtual, view);
 +      if (view)
-+        setup_view (virtual_src, view);
++        setup_view (source_virtual, view);
  
        meta_eis_viewport_notify_changed (META_EIS_VIEWPORT (stream));
      }
-@@ -444,6 +464,13 @@ meta_screen_cast_virtual_stream_src_record_to_buffer (MetaScreenCastStreamSrc
+@@ -414,6 +434,13 @@ meta_stream_source_virtual_record_to_buffer (MetaStreamSource      *source,
+   float scale;
  
-   stream = meta_screen_cast_stream_src_get_stream (src);
-   view = view_from_src (src);
+   view = view_from_source (source);
 +  if (!view)
 +    {
 +      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -87,13 +87,13 @@ index 7c31b0b..6906c58 100644
 +      return FALSE;
 +    }
 +
+   framebuffer = clutter_stage_view_get_onscreen (view);
    scale = clutter_stage_view_get_scale (view);
    clutter_stage_view_get_layout (view, &view_rect);
- 
-@@ -483,6 +510,13 @@ meta_screen_cast_virtual_stream_src_record_to_framebuffer (MetaScreenCastStreamS
+@@ -439,6 +466,13 @@ meta_stream_source_virtual_record_to_framebuffer (MetaStreamSource      *source,
    CoglFramebuffer *view_framebuffer;
  
-   view = view_from_src (src);
+   view = view_from_source (source);
 +  if (!view)
 +    {
 +      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -102,53 +102,53 @@ index 7c31b0b..6906c58 100644
 +    }
 +
    view_framebuffer = clutter_stage_view_get_framebuffer (view);
-   if (!cogl_framebuffer_blit (view_framebuffer,
-                               framebuffer,
-@@ -501,15 +535,21 @@ static void
- meta_screen_cast_virtual_stream_queue_follow_up (MetaScreenCastStreamSrc  *src,
-                                                  MetaScreenCastRecordFlag  flags)
+   if (damage ?
+       !cogl_framebuffer_blit_region (view_framebuffer,
+@@ -463,15 +497,21 @@ static void
+ meta_stream_source_virtual_queue_follow_up (MetaStreamSource     *source,
+                         MetaStreamRecordFlag  flags)
  {
 +  ClutterStageView *view;
 +
-+  view = view_from_src (src);
++  view = view_from_source (source);
 +  if (!view)
 +    return;
 +
-   if (flags & META_SCREEN_CAST_RECORD_FLAG_CURSOR_ONLY)
+   if (flags & META_STREAM_RECORD_FLAG_CURSOR_ONLY)
      {
--      clutter_stage_view_schedule_update (view_from_src (src));
+-      clutter_stage_view_schedule_update (view_from_source (source));
 +      clutter_stage_view_schedule_update (view);
      }
    else
      {
        MtkRectangle damage;
  
--      clutter_stage_view_get_layout (view_from_src (src), &damage);
+-      clutter_stage_view_get_layout (view_from_source (source), &damage);
 +      clutter_stage_view_get_layout (view, &damage);
        damage.width = 1;
        damage.height = 1;
  
-@@ -525,11 +565,15 @@ is_cursor_in_stream (MetaScreenCastVirtualStreamSrc *virtual_src)
-   MetaBackend *backend = backend_from_src (src);
+@@ -487,11 +527,15 @@ is_cursor_in_stream (MetaStreamSourceVirtual *source_virtual)
+   MetaBackend *backend = backend_from_source (source);
    MetaCursorRenderer *cursor_renderer =
      meta_backend_get_cursor_renderer (backend);
--  ClutterStageView *stage_view = view_from_src (src);
+-  ClutterStageView *stage_view = view_from_source (source);
 +  ClutterStageView *stage_view;
    MtkRectangle view_layout;
    graphene_rect_t view_rect;
    ClutterCursor *cursor = NULL;
  
-+  stage_view = view_from_src (src);
++  stage_view = view_from_source (source);
 +  if (!stage_view)
 +    return FALSE;
 +
    clutter_stage_view_get_layout (stage_view, &view_layout);
    view_rect = mtk_rectangle_to_graphene_rect (&view_layout);
  
-@@ -584,6 +628,13 @@ get_cursor_position (MetaScreenCastVirtualStreamSrc *virtual_src,
+@@ -546,6 +590,13 @@ get_cursor_position (MetaStreamSourceVirtual *source_virtual,
    graphene_point_t cursor_position;
  
-   stage_view = view_from_src (src);
+   stage_view = view_from_source (source);
 +  if (!stage_view)
 +    {
 +      *out_x = 0;
@@ -159,27 +159,27 @@ index 7c31b0b..6906c58 100644
    view_scale = clutter_stage_view_get_scale (stage_view);
    clutter_stage_view_get_layout (stage_view, &view_layout);
    view_rect = mtk_rectangle_to_graphene_rect (&view_layout);
-@@ -670,6 +721,9 @@ meta_screen_cast_virtual_stream_src_set_cursor_metadata (MetaScreenCastStreamSrc
+@@ -630,6 +681,9 @@ meta_stream_source_virtual_set_cursor_metadata (MetaStreamSource       *source,
            float view_scale;
  
-           stage_view = view_from_src (src);
+           stage_view = view_from_source (source);
 +          if (!stage_view)
 +            return;
 +
            view_scale = clutter_stage_view_get_scale (stage_view);
  
-           meta_screen_cast_stream_src_set_cursor_sprite_metadata (src,
-@@ -823,10 +877,15 @@ meta_screen_cast_virtual_stream_src_notify_params_updated (MetaScreenCastStreamS
+           meta_stream_source_set_cursor_sprite_metadata (source,
+@@ -783,10 +837,15 @@ meta_stream_source_virtual_notify_params_updated (MetaStreamSource          *sou
  static void
- meta_screen_cast_virtual_stream_src_dispatch (MetaScreenCastStreamSrc *src)
+ meta_stream_source_virtual_dispatch (MetaStreamSource *source)
  {
--  ClutterStageView *view = view_from_src (src);
+-  ClutterStageView *view = view_from_source (source);
 -  ClutterFrameClock *frame_clock = clutter_stage_view_get_frame_clock (view);
 +  ClutterStageView *view;
 +  ClutterFrameClock *frame_clock;
    ClutterFrameResult result;
  
-+  view = view_from_src (src);
++  view = view_from_source (source);
 +  if (!view)
 +    return;
 +

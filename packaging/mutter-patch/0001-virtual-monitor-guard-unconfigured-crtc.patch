@@ -1,11 +1,11 @@
-diff --git a/src/backends/meta-screen-cast-virtual-stream-src.c b/src/backends/meta-screen-cast-virtual-stream-src.c
-index 24757eb..7c31b0b 100644
---- a/src/backends/meta-screen-cast-virtual-stream-src.c
-+++ b/src/backends/meta-screen-cast-virtual-stream-src.c
-@@ -119,6 +119,21 @@ meta_screen_cast_virtual_stream_src_get_specs (MetaScreenCastStreamSrc *src,
+diff --git a/src/backends/meta-stream-source-virtual.c b/src/backends/meta-stream-source-virtual.c
+index d97213362e..89ff908f65 100644
+--- a/src/backends/meta-stream-source-virtual.c
++++ b/src/backends/meta-stream-source-virtual.c
+@@ -114,6 +114,21 @@ meta_stream_source_virtual_get_specs (MetaStreamSource *source,
      return FALSE;
  
-   crtc_mode = meta_virtual_monitor_get_crtc_mode (virtual_src->virtual_monitor);
+   crtc_mode = meta_virtual_monitor_get_crtc_mode (source_virtual->virtual_monitor);
 +  if (!crtc_mode)
 +    {
 +      /* The monitor manager has not assigned a CRTC configuration yet, which
@@ -13,7 +13,7 @@ index 24757eb..7c31b0b 100644
 +       * containing this monitor. Fall back to the mode that was requested,
 +       * which is what the CRTC will end up using anyway.
 +       */
-+      const MetaVirtualModeInfo *mode_info = virtual_src->mode_infos->data;
++      const MetaVirtualModeInfo *mode_info = source_virtual->mode_infos->data;
 +
 +      *width = mode_info->width;
 +      *height = mode_info->height;
@@ -24,7 +24,7 @@ index 24757eb..7c31b0b 100644
    crtc_mode_info = meta_crtc_mode_get_info (crtc_mode);
  
    *width = crtc_mode_info->width;
-@@ -755,12 +770,21 @@ ensure_virtual_monitor (MetaScreenCastVirtualStreamSrc *virtual_src,
+@@ -715,12 +730,21 @@ ensure_virtual_monitor (MetaStreamSourceVirtual   *source_virtual,
        MetaCrtcMode *crtc_mode =
          meta_virtual_monitor_get_crtc_mode (virtual_monitor);
        g_autolist (MetaVirtualModeInfo) mode_infos = NULL;
@@ -32,7 +32,7 @@ index 24757eb..7c31b0b 100644
  
 -      if (mode_info->width == video_format->size.width &&
 -          mode_info->height == video_format->size.height &&
--          mode_info->preferred_scale == virtual_src->preferred_scale)
+-          mode_info->preferred_scale == source_virtual->preferred_scale)
 -        return;
 +      /* A CRTC configuration may not have been assigned yet, in which case
 +       * there is no current mode to compare against and the modes below are
@@ -45,17 +45,17 @@ index 24757eb..7c31b0b 100644
 +
 +          if (mode_info->width == video_format->size.width &&
 +              mode_info->height == video_format->size.height &&
-+              mode_info->preferred_scale == virtual_src->preferred_scale)
++              mode_info->preferred_scale == source_virtual->preferred_scale)
 +            return;
 +        }
  
-       mode_infos = g_list_append (mode_infos, create_mode_info (virtual_src,
+       mode_infos = g_list_append (mode_infos, create_mode_info (source_virtual,
                                                                  video_format));
 diff --git a/src/backends/meta-virtual-monitor.c b/src/backends/meta-virtual-monitor.c
-index f77bcbb..1fbb5b2 100644
+index c832eb16e6..8416475929 100644
 --- a/src/backends/meta-virtual-monitor.c
 +++ b/src/backends/meta-virtual-monitor.c
-@@ -154,6 +154,9 @@ meta_virtual_monitor_get_crtc_mode (MetaVirtualMonitor *virtual_monitor)
+@@ -169,6 +169,9 @@ meta_virtual_monitor_get_crtc_mode (MetaVirtualMonitor *virtual_monitor)
    const MetaCrtcConfig *crtc_config;
  
    crtc_config = meta_crtc_get_config (priv->crtc);

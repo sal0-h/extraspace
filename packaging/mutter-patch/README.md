@@ -2,7 +2,7 @@
 
 ExtraSpace's sharp display path asks mutter for a virtual monitor at the
 tablet's full panel resolution, passing the UI scale as the mode's
-`preferred-scale`. On stock mutter 50.4 and 50.5 that logs you out.
+`preferred-scale`. On stock mutter 50.4, 50.5, and 51.0 that logs you out.
 
 ## What goes wrong
 
@@ -13,7 +13,7 @@ dereference it anyway:
 
 - `meta_virtual_monitor_get_crtc_mode()` reads `crtc_config->mode` without
   checking that a configuration exists.
-- `meta_screen_cast_virtual_stream_src_get_specs()` uses the mode it returns,
+- `meta_stream_source_virtual_get_specs()` uses the mode it returns,
   and `ensure_virtual_monitor()` compares against it.
 
 Either one takes gnome-shell down with a SIGSEGV, which on Wayland means the
@@ -27,8 +27,8 @@ callers until a view exists.
 
 `0001-virtual-monitor-guard-unconfigured-crtc.patch` adds the missing checks and
 falls back to the mode that was requested, which is what the CRTC ends up using
-anyway. It touches no ABI: the soname stays `libmutter-18.so=0-64`, so
-gnome-shell does not need rebuilding.
+anyway. It touches no ABI: the soname stays `libmutter-51.so`, matching
+gnome-shell 51, so gnome-shell does not need rebuilding.
 
 This is reported upstream as [mutter#5007][], and `UPSTREAM-REPORT.md` is the
 write-up that was filed. `upstream-main.patch` is the CRTC fix ported to mutter
@@ -46,7 +46,7 @@ takes both, none of this directory is needed any more.
 Then log out and back in — a running compositor keeps the library it started
 with. `PKGBUILD` is Arch's `mutter` recipe with `pkgrel` bumped and the patches
 added to `source`, so it tracks whatever version that recipe is based on.
-The current target is 50.5-2 (stock extra is 50.5-1).
+The current target is 51.0-2 (stock extra is 51.0-1).
 
 To go back to the stock package:
 
