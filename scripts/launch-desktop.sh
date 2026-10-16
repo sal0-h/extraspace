@@ -14,4 +14,4 @@ for sdk_root in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "$HOME/Android/Sdk";
   fi
 done
 
-exec "$BIN_DIR/extraspace"
+exec "$BIN_DIR/extraspace" "$@"

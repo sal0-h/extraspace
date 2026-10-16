@@ -25,7 +25,36 @@ flowchart LR
 | `xs-transport` | ADB orchestration, companion installation, and framed sockets |
 | `xs-camera` | Decode the tablet camera stream into a V4L2 loopback device |
 | `xs-core` | Session lifecycle and adaptive bitrate control |
-| `xs-ui` | GTK4/libadwaita interface and persisted user settings |
+| `xs-ui` | Application lifetime, exported controls, optional GTK settings, and persisted settings |
+
+## Background application and Quick Settings
+
+`xs-ui::controller` owns one engine and cached session/telemetry state. Controls
+are exported as GApplication actions on the session bus at
+`io.github.tymonoman.Extraspace`, `/io/github/tymonoman/Extraspace`.
+`set-display`, `set-scale`, `set-mode`, and the pairing actions work without a
+settings window. Read-only `display-enabled` and `session-state` actions expose
+requested display use and actual connection state separately.
+
+The GNOME 51 extension in `extension/` watches that bus name and action changes.
+Its tile uses installed desktop actions to start the process on demand. It has
+no idle polling timer and never runs video or networking code inside Shell.
+`--background` starts the display without constructing a window; `--settings`
+opens settings without starting the display; `--pair` opens pairing and enables
+connections. Ordinary launches retain the window and auto-connect behavior.
+
+Closing settings hides it while the display is enabled. When disabled, closing
+settings quits. Off and Quit wait for engine shutdown and then exit the process,
+releasing capture, sockets, and discovery. A settings-only process rejects
+incoming Wi-Fi data channels until Connect is requested; pairing remains explicit.
+
+The hardware-free lifecycle check uses a private bus and a virtual display:
+
+```bash
+GSETTINGS_BACKEND=memory GSK_RENDERER=cairo GTK_A11Y=none \
+  dbus-run-session -- xvfb-run -a python3 scripts/test-background.py target/release/extraspace
+node extension/tests/state.mjs
+```
 
 ## GNOME session setup
 

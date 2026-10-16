@@ -44,6 +44,18 @@ The manual capture and simulated
 tablet examples require GNOME on Wayland; see
 [integration examples](docs/architecture.md#integration-examples).
 
+After building, test the background application on a private session bus:
+
+```bash
+GSETTINGS_BACKEND=memory GSK_RENDERER=cairo GTK_A11Y=none \
+  dbus-run-session -- xvfb-run -a python3 scripts/test-background.py target/release/extraspace
+node extension/tests/state.mjs
+```
+
+The lifecycle script needs Python's GI bindings (`python3-gi` on Debian/Ubuntu).
+The Quick Settings extension targets GNOME 51; test Shell integration in a
+separate Shell session before loading a changed extension into your desktop.
+
 ## Keep the two halves compatible
 
 If you change `xs-proto`, update

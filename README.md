@@ -116,9 +116,19 @@ Open **Extra Display** to start streaming. Arrange the new monitor in
 ./scripts/install.sh
 ```
 
-The installer copies the desktop binary, icon, launcher, and locally built APK
-under `~/.local`. Open Extraspace from the app grid or run `extraspace` in a
-terminal. It starts when you open it.
+The installer copies the desktop binary, icon, launcher, locally built APK, and
+GNOME Quick Settings extension under `~/.local`. The extension currently targets
+GNOME 51. A new extension may need one logout/login before Shell discovers it.
+
+In Quick Settings, turn **Extraspace** on to start the tablet display without an
+app window. The tile shows whether it is connecting, waiting, or connected over
+USB or Wi-Fi. **Off** stops streaming and exits the Extraspace process. The tile
+does not poll or start the app while off.
+
+Use the tile's dropdown for **Settings** or **Pair tablet**. Closing Settings
+keeps an enabled display running; closing it while the display is off exits the
+app. Opening Extraspace from the app grid still opens its window and connects as
+before. Right-click its launcher for settings without starting the display.
 
 To uninstall:
 
@@ -156,7 +166,8 @@ with the tablet camera, or enter the grouped code in the tablet app. Both device
 must be on the same local network. Pairing codes expire after five minutes and
 can be used once.
 
-After pairing, opening both apps reconnects automatically. No IP addresses,
+After pairing, turn Extraspace on in Quick Settings (or launch the desktop app)
+and open it on the tablet to reconnect automatically. No IP addresses,
 terminal commands, Android Wireless debugging, or repeat pairing are needed.
 Wi-Fi discovery and streaming run only while the tablet app is visible. Going
 Home or switching to another app stops them; returning reconnects automatically.

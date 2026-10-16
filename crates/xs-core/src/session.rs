@@ -242,7 +242,9 @@ pub async fn run(
     emit(State::Idle);
 
     let mut health = tokio::time::interval(Duration::from_millis(500));
-    let mut accept_wireless = true;
+    // A settings-only process must not silently start streaming. Connect is
+    // the explicit request from either the window or the shell toggle.
+    let mut accept_wireless = false;
     loop {
         let allow_wifi = accept_wireless
             && match active.as_ref().map(|a| &a.transport).or(recovery.as_ref()) {

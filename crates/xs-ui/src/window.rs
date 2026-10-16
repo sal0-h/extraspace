@@ -11,14 +11,15 @@
 //! authorised -- are entirely fixable by the user, so each gets its own page
 //! saying exactly which buttons to press.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
-use xs_core::{Command, DisplayMode, EngineHandle, Event, State, Stats};
+use xs_core::{DisplayMode, Event, State, Stats};
 
 use crate::config::{scale_index, Config, SCALE_OPTIONS};
+use crate::controller::Controller;
 
 pub const APP_ID: &str = "io.github.tymonoman.Extraspace";
 
@@ -45,7 +46,62 @@ struct Widgets {
     stat_encoder: adw::ActionRow,
 }
 
-pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Config>>) {
+pub struct WindowUi {
+    window: adw::ApplicationWindow,
+    widgets: Rc<Widgets>,
+    pairing: Rc<crate::pairing::PairingUi>,
+}
+
+impl WindowUi {
+    pub fn present(&self) {
+        self.window.present();
+    }
+    pub fn hide(&self) {
+        self.window.set_visible(false);
+    }
+    pub fn pair(&self) {
+        self.pairing.pair();
+    }
+    pub fn devices(&self) {
+        self.pairing.devices();
+    }
+
+    pub fn render(&self, state: &State, stats: &Stats, enabled: bool, config: &Config) {
+        apply_state(&self.widgets, state, enabled);
+        apply_stats(&self.widgets, stats);
+        self.widgets
+            .scale_row
+            .set_selected(scale_index(config.scale));
+        self.widgets
+            .mode_row
+            .set_selected(if config.display_mode() == DisplayMode::Mirror {
+                1
+            } else {
+                0
+            });
+        self.widgets.camera_switch.set_active(config.camera_enabled);
+        update_scale_subtitle(&self.widgets, config.scale);
+    }
+
+    pub fn event(&self, event: &Event) {
+        match event {
+            Event::Warning(message) => {
+                self.widgets.toasts.add_toast(adw::Toast::new(message));
+            }
+            Event::Wireless(event) => {
+                self.pairing.event(event);
+                if let xs_core::WirelessEvent::Paired(peer) = event {
+                    self.widgets
+                        .toasts
+                        .add_toast(adw::Toast::new(&format!("{} paired", peer.name)));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn build(app: &adw::Application, controller: Rc<Controller>) -> Rc<WindowUi> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Extraspace")
@@ -78,83 +134,24 @@ pub fn build(app: &adw::Application, engine: EngineHandle, config: Rc<RefCell<Co
     window.set_content(Some(&toolbar));
 
     let widgets = Rc::new(widgets);
-    let pairing = crate::pairing::PairingUi::new(&window, &engine);
-    for (name, show_devices) in [("pair-tablet", false), ("paired-devices", true)] {
-        let action = gtk::gio::SimpleAction::new(name, None);
-        let pairing = Rc::clone(&pairing);
-        action.connect_activate(move |_, _| {
-            if show_devices {
-                pairing.devices();
-            } else {
-                pairing.pair();
-            }
-        });
-        app.add_action(&action);
-    }
-    let pairing_button = Rc::clone(&pairing);
+    let pairing = crate::pairing::PairingUi::new(&window, &controller.engine);
+    let pairing_button = Rc::clone(&controller);
     widgets.pair_button.connect_clicked(move |_| {
-        pairing_button.pair();
+        pairing_button.pair_tablet();
     });
     wire_actions(app, &window);
-    wire_controls(&widgets, &engine, &config);
-    // Keep application actions on the same controls as user interaction. These
-    // also let diagnostics read the actual session state without guessing from
-    // open sockets, which may belong to an incomplete connection attempt.
-    let session_state =
-        gtk::gio::SimpleAction::new_stateful("session-state", None, &"\"Idle\"".to_variant());
-    session_state.set_enabled(false);
-    app.add_action(&session_state);
-    let set_display =
-        gtk::gio::SimpleAction::new("set-display", Some(&bool::static_variant_type()));
-    let display_switch = widgets.display_switch.clone();
-    set_display.connect_activate(move |_, parameter| {
-        if let Some(enabled) = parameter.and_then(|p| p.get::<bool>()) {
-            display_switch.set_active(enabled);
-        }
-    });
-    app.add_action(&set_display);
-    let set_scale = gtk::gio::SimpleAction::new("set-scale", Some(&f64::static_variant_type()));
-    let scale_row = widgets.scale_row.clone();
-    set_scale.connect_activate(move |_, parameter| {
-        if let Some(scale) = parameter
-            .and_then(|p| p.get::<f64>())
-            .filter(|s| s.is_finite())
-        {
-            scale_row.set_selected(scale_index(scale));
-        }
-    });
-    app.add_action(&set_scale);
-    let set_mode = gtk::gio::SimpleAction::new("set-mode", Some(&String::static_variant_type()));
-    let mode_row = widgets.mode_row.clone();
-    set_mode.connect_activate(move |_, parameter| match parameter.and_then(|p| p.str()) {
-        Some("extend") => mode_row.set_selected(0),
-        Some("mirror") => mode_row.set_selected(1),
-        _ => {}
-    });
-    app.add_action(&set_mode);
-    listen_to_engine(&widgets, &engine, pairing, session_state);
-
-    let engine_on_close = engine.clone();
-    let closing = Rc::new(Cell::new(false));
-    window.connect_close_request(move |window| {
-        if closing.replace(true) {
-            return glib::Propagation::Proceed;
-        }
-        let window = window.clone();
-        let engine = engine_on_close.clone();
-        glib::spawn_future_local(async move {
-            engine.shutdown().await;
-            window.close();
-        });
+    wire_controls(&widgets, &controller);
+    // Closing settings leaves the display running. Off and Quit end the engine.
+    let on_close = Rc::clone(&controller);
+    window.connect_close_request(move |_| {
+        on_close.close_settings();
         glib::Propagation::Stop
     });
-
-    // Look for a tablet straight away; the user opened the app to use it.
-    if config.borrow().auto_connect {
-        engine.send(Command::Connect);
-    }
-
-    window.present();
+    Rc::new(WindowUi {
+        window,
+        widgets,
+        pairing,
+    })
 }
 
 fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
@@ -302,11 +299,6 @@ fn gio_menu() -> gtk::gio::Menu {
 }
 
 fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
-    let quit = gtk::gio::SimpleAction::new("quit", None);
-    let close_window = window.clone();
-    quit.connect_activate(move |_, _| close_window.close());
-    app.add_action(&quit);
-    app.set_accels_for_action("app.quit", &["<Primary>q"]);
     let about = gtk::gio::SimpleAction::new("about", None);
     let parent = window.clone();
     about.connect_activate(move |_, _| {
@@ -325,11 +317,10 @@ fn wire_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
     app.add_action(&about);
 }
 
-fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCell<Config>>) {
-    // Reflect stored settings before connecting handlers, so restoring state
-    // does not immediately fire a command back at the engine.
+fn wire_controls(widgets: &Rc<Widgets>, controller: &Rc<Controller>) {
+    // Restore settings before attaching notifications.
     {
-        let c = config.borrow();
+        let c = controller.config.borrow();
         widgets.scale_row.set_selected(scale_index(c.scale));
         widgets
             .mode_row
@@ -339,81 +330,42 @@ fn wire_controls(widgets: &Rc<Widgets>, engine: &EngineHandle, config: &Rc<RefCe
                 0
             });
         widgets.camera_switch.set_active(c.camera_enabled);
+        update_scale_subtitle(widgets, c.scale);
     }
-    update_scale_subtitle(widgets, config);
-
-    {
-        let engine = engine.clone();
-        let handler = widgets.display_switch.connect_active_notify(move |row| {
-            engine.send(if row.is_active() {
-                Command::Connect
-            } else {
-                Command::Disconnect
-            });
+    let display = Rc::clone(controller);
+    let handler = widgets.display_switch.connect_active_notify(move |row| {
+        if row.is_active() {
+            display.start();
+        } else {
+            display.quit();
+        }
+    });
+    widgets.display_switch_handler.replace(Some(handler));
+    let scale = Rc::clone(controller);
+    widgets.scale_row.connect_selected_notify(move |row| {
+        if let Some(&value) = SCALE_OPTIONS.get(row.selected() as usize) {
+            scale.set_scale(value);
+        }
+    });
+    let mode = Rc::clone(controller);
+    widgets.mode_row.connect_selected_notify(move |row| {
+        mode.set_mode(if row.selected() == 1 {
+            DisplayMode::Mirror
+        } else {
+            DisplayMode::Extend
         });
-        widgets.display_switch_handler.replace(Some(handler));
-    }
-
-    {
-        let engine = engine.clone();
-        let config = Rc::clone(config);
-        let widgets_ref = Rc::clone(widgets);
-        widgets.scale_row.connect_selected_notify(move |row| {
-            let Some(&scale) = SCALE_OPTIONS.get(row.selected() as usize) else {
-                return;
-            };
-            config.borrow_mut().scale = scale;
-            config.borrow().save();
-            update_scale_subtitle(&widgets_ref, &config);
-            engine.send(Command::SetScale(scale));
-        });
-    }
-
-    {
-        let engine = engine.clone();
-        let config = Rc::clone(config);
-        widgets.mode_row.connect_selected_notify(move |row| {
-            let mode = if row.selected() == 1 {
-                DisplayMode::Mirror
-            } else {
-                DisplayMode::Extend
-            };
-            config.borrow_mut().mode = if row.selected() == 1 {
-                "mirror"
-            } else {
-                "extend"
-            }
-            .into();
-            config.borrow().save();
-            engine.send(Command::SetMode(mode));
-        });
-    }
-
-    {
-        let engine = engine.clone();
-        let config = Rc::clone(config);
-        widgets.camera_switch.connect_active_notify(move |row| {
-            let enabled = row.is_active();
-            let camera_id = {
-                let mut c = config.borrow_mut();
-                c.camera_enabled = enabled;
-                c.camera_id.clone()
-            };
-            config.borrow().save();
-            engine.send(Command::SetCamera { enabled, camera_id });
-        });
-    }
-
-    {
-        let engine = engine.clone();
-        widgets.status_button.connect_clicked(move |_| {
-            engine.send(Command::Connect);
-        });
-    }
+    });
+    let camera = Rc::clone(controller);
+    widgets
+        .camera_switch
+        .connect_active_notify(move |row| camera.set_camera(row.is_active()));
+    let connect = Rc::clone(controller);
+    widgets
+        .status_button
+        .connect_clicked(move |_| connect.start());
 }
 
-fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
-    let scale = config.borrow().scale;
+fn update_scale_subtitle(widgets: &Rc<Widgets>, scale: f64) {
     let description = if xs_core::modes_enabled() {
         "GNOME scale at panel resolution"
     } else {
@@ -424,52 +376,9 @@ fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Rc<RefCell<Config>>) {
         .set_subtitle(&format!("{scale}× — {description}"));
 }
 
-fn listen_to_engine(
-    widgets: &Rc<Widgets>,
-    engine: &EngineHandle,
-    pairing: Rc<crate::pairing::PairingUi>,
-    session_state: gtk::gio::SimpleAction,
-) {
-    let mut events = engine.subscribe();
-    let widgets = Rc::clone(widgets);
-
-    glib::spawn_future_local(async move {
-        loop {
-            match events.recv().await {
-                Ok(Event::State(state)) => {
-                    if let Ok(serialized) = serde_json::to_string(&state) {
-                        session_state.set_state(&serialized.to_variant());
-                    }
-                    apply_state(&widgets, &state);
-                }
-                Ok(Event::Stats(stats)) => apply_stats(&widgets, &stats),
-                Ok(Event::Warning(message)) => {
-                    widgets.toasts.add_toast(adw::Toast::new(&message));
-                }
-                Ok(Event::Wireless(event)) => {
-                    pairing.event(&event);
-                    if let xs_core::WirelessEvent::Paired(peer) = event {
-                        widgets
-                            .toasts
-                            .add_toast(adw::Toast::new(&format!("{} paired", peer.name)));
-                    }
-                }
-                // Lagged means the UI fell behind a burst; the next state event
-                // resyncs it, so there is nothing useful to do but continue.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-}
-
-fn apply_state(widgets: &Rc<Widgets>, state: &State) {
+fn apply_state(widgets: &Rc<Widgets>, state: &State, enabled: bool) {
     // Automatic Wi-Fi connections and the status-page Connect button bypass
     // the switch. Render the engine's state without echoing a new command.
-    let enabled = matches!(
-        state,
-        State::Connecting { .. } | State::WaitingForTablet { .. } | State::Streaming { .. }
-    );
     {
         let handler = widgets.display_switch_handler.borrow();
         if let Some(handler) = handler.as_ref() {
@@ -502,7 +411,7 @@ fn apply_state(widgets: &Rc<Widgets>, state: &State) {
             show_status(
                 "video-display-symbolic",
                 "Ready",
-                "Turn on Extra Display to start streaming to your tablet.",
+                "Choose Connect to start streaming to your tablet.",
                 Some("Connect"),
             );
         }
@@ -631,7 +540,7 @@ mod tests {
             height: 960,
             encoder: "test".into(),
         };
-        apply_state(&widgets, &streaming);
+        apply_state(&widgets, &streaming, true);
         assert!(widgets.display_switch.is_active());
         assert_eq!(
             widgets.stack.visible_child_name().as_deref(),
@@ -658,15 +567,15 @@ mod tests {
                 step: "Reconnecting".into(),
             },
         ] {
-            apply_state(&widgets, &state);
             let enabled = matches!(
                 state,
                 State::Streaming { .. } | State::WaitingForTablet { .. } | State::Connecting { .. }
             );
+            apply_state(&widgets, &state, enabled);
             assert_eq!(widgets.display_switch.is_active(), enabled, "{state:?}");
             assert_eq!(*commands.borrow(), vec![false]);
         }
-        apply_state(&widgets, &State::Idle);
+        apply_state(&widgets, &State::Idle, false);
         widgets.display_switch.set_active(true);
         assert_eq!(*commands.borrow(), vec![false, true]);
     }

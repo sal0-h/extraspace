@@ -1,0 +1,8 @@
+{
+  "uuid": "extraspace@sal0-h",
+  "name": "Extraspace",
+  "description": "Control your Extraspace tablet display from Quick Settings.",
+  "shell-version": ["51"],
+  "url": "https://github.com/sal0-h/extraspace",
+  "version": 1
+}

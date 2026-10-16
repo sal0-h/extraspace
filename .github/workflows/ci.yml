@@ -31,7 +31,7 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
-            libpipewire-0.3-dev xvfb xauth
+            libpipewire-0.3-dev xvfb xauth python3-gi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,6 +51,12 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked
+
+      - name: Background application lifecycle
+        run: GSETTINGS_BACKEND=memory GSK_RENDERER=cairo GTK_A11Y=none dbus-run-session -- xvfb-run -a python3 scripts/test-background.py target/release/extraspace
+
+      - name: Quick Settings state
+        run: node extension/tests/state.mjs
 
   android:
     name: Android

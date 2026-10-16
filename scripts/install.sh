@@ -11,12 +11,14 @@ set -euo pipefail
 
 APP_ID="io.github.tymonoman.Extraspace"
 BIN_NAME="extraspace"
+EXTENSION_UUID="extraspace@sal0-h"
 
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 DESKTOP_DIR="$DATA_DIR/applications"
 ICON_DIR="$DATA_DIR/icons/hicolor/scalable/apps"
+EXTENSION_DIR="$DATA_DIR/gnome-shell/extensions/$EXTENSION_UUID"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -27,6 +29,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$BIN_DIR/$BIN_NAME" && ok "removed $BIN_DIR/$BIN_NAME"
   rm -f "$BIN_DIR/extraspace-launcher" && ok "removed desktop launcher helper"
   rm -f "$DESKTOP_DIR/$APP_ID.desktop" && ok "removed desktop entry"
+  rm -f "$DESKTOP_DIR/$APP_ID.Fast.desktop"
+  gnome-extensions disable "$EXTENSION_UUID" 2>/dev/null || true
+  for extension_file in extension.js state.js metadata.json; do
+    rm -f "$EXTENSION_DIR/$extension_file"
+  done
+  rmdir "$EXTENSION_DIR" 2>/dev/null || true
   rm -f "$HOME/.config/autostart/$APP_ID.desktop" && ok "removed autostart"
   rm -f "$ICON_DIR/$APP_ID.svg" && ok "removed icon"
   rm -f "$DATA_DIR/extraspace/extraspace.apk" && ok "removed companion APK"
@@ -53,10 +61,11 @@ fi
 # Copied rather than symlinked: a symlink into target/ breaks the moment anyone
 # runs `cargo clean`, and the failure ("No such file") gives no hint why.
 mkdir -p "$BIN_DIR"
-install -m755 "$BINARY" "$BIN_DIR/$BIN_NAME"
+install -m755 "$BINARY" "$BIN_DIR/$BIN_NAME.new"
+mv -f "$BIN_DIR/$BIN_NAME.new" "$BIN_DIR/$BIN_NAME"
 ok "installed $BIN_DIR/$BIN_NAME"
 install -m755 "$REPO_ROOT/scripts/launch-desktop.sh" "$BIN_DIR/extraspace-launcher"
-ok "installed wireless-aware desktop launcher"
+ok "installed desktop launcher"
 
 # --- companion APK -----------------------------------------------------------
 # Desktop launches start with cwd=$HOME, so the relative android/ tree in the
@@ -106,12 +115,48 @@ Keywords=display;monitor;tablet;android;screen;webcam;camera;second screen;
 StartupNotify=true
 StartupWMClass=$BIN_NAME
 X-GNOME-Autostart-enabled=false
+Actions=Background;Settings;Pair;
+
+[Desktop Action Background]
+Name=Start tablet display
+Exec=$BIN_DIR/extraspace-launcher --background
+
+[Desktop Action Settings]
+Name=Settings
+Exec=$BIN_DIR/extraspace-launcher --settings
+
+[Desktop Action Pair]
+Name=Pair tablet
+Exec=$BIN_DIR/extraspace-launcher --pair
 EOF
 ok "installed desktop entry"
+# Earlier personal installations used a second entry with the same app name.
+# Keep one search result, including its new background and settings actions.
+if [[ -f "$DESKTOP_DIR/$APP_ID.Fast.desktop" ]] && \
+   grep -Fq "Exec=$BIN_DIR/extraspace-launcher" "$DESKTOP_DIR/$APP_ID.Fast.desktop"; then
+  rm -f "$DESKTOP_DIR/$APP_ID.Fast.desktop"
+fi
 
-# Do not autostart. ExtraSpace is a normal windowed app; start it from the
-# grid or with `extraspace` when you want it. Clear a leftover login entry
-# from older installs so it does not come back.
+mkdir -p "$EXTENSION_DIR"
+for extension_file in extension.js state.js metadata.json; do
+  install -m644 "$REPO_ROOT/extension/$extension_file" "$EXTENSION_DIR/$extension_file"
+done
+ok "installed Quick Settings extension"
+if command -v gnome-extensions >/dev/null && [[ "$(gnome-shell --version 2>/dev/null)" == "GNOME Shell 51."* ]]; then
+  if gnome-extensions enable "$EXTENSION_UUID" 2>/dev/null; then
+    ok "enabled Extraspace in Quick Settings"
+  else
+    # Shell may not discover a brand-new extension until its next login. Save
+    # the choice now without replacing any of the user's other extensions.
+    if command -v gjs >/dev/null; then
+      gjs -c 'const Gio = imports.gi.Gio; const s = new Gio.Settings({schema_id: "org.gnome.shell"}); const enabled = s.get_strv("enabled-extensions"); if (!enabled.includes("extraspace@sal0-h")) s.set_strv("enabled-extensions", [...enabled, "extraspace@sal0-h"]); s.set_strv("disabled-extensions", s.get_strv("disabled-extensions").filter(id => id !== "extraspace@sal0-h")); Gio.Settings.sync();'
+    fi
+    warn "Log out and back in once to load the new Quick Settings extension."
+  fi
+fi
+
+# The Shell tile is available at login; the streaming process starts only when
+# requested. Clear any old autostart entry.
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop"
 
 update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true

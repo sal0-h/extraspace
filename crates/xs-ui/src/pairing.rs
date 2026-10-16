@@ -31,7 +31,7 @@ impl PairingUi {
         let Some(wireless) = self.engine.wireless.as_ref() else {
             self.message(
                 "Wi-Fi unavailable",
-                "Extraspace could not start its Wi-Fi service. Close the app and try again.",
+                "Extraspace could not start its Wi-Fi service. Quit Extraspace and turn it on again.",
             );
             return;
         };
@@ -157,7 +157,7 @@ impl PairingUi {
             .margin_start(24)
             .margin_end(24)
             .build();
-        let description = gtk::Label::builder().label("Saved tablets can connect while Extraspace is open. Forget a tablet to revoke its access.")
+        let description = gtk::Label::builder().label("Saved tablets can connect while Extraspace is turned on. Forget a tablet to revoke its access.")
             .wrap(true).xalign(0.0).build();
         content.append(&description);
         let group = adw::PreferencesGroup::new();

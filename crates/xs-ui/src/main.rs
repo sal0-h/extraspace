@@ -8,6 +8,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 mod config;
+mod controller;
 mod pairing;
 mod window;
 
@@ -29,28 +30,53 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::FAILURE;
     }
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(|app| {
-        if let Some(window) = app.active_window() {
-            window.present();
-            return;
-        }
-        let config = Rc::new(RefCell::new(Config::load()));
-        let engine = xs_core::spawn(session_config(&config.borrow()));
-        let diagnostic = gtk::gio::SimpleAction::new(
-            "save-video-diagnostic",
-            Some(&String::static_variant_type()),
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
+    for (name, description) in [
+        ("background", "Start the display without opening a window"),
+        ("settings", "Open settings without starting the display"),
+        ("pair", "Pair a tablet using a QR code or pairing code"),
+    ] {
+        app.add_main_option(
+            name,
+            0.into(),
+            glib::OptionFlags::NONE,
+            glib::OptionArg::None,
+            description,
+            None,
         );
-        let diagnostic_engine = engine.clone();
-        diagnostic.connect_activate(move |_, parameter| {
-            if let Some(directory) = parameter.and_then(|value| value.str()) {
-                diagnostic_engine.send(xs_core::Command::SaveVideoDiagnostic(PathBuf::from(
-                    directory,
-                )));
+    }
+    let controller = Rc::new(RefCell::new(None::<Rc<controller::Controller>>));
+    let startup = Rc::clone(&controller);
+    app.connect_startup(move |app| {
+        *startup.borrow_mut() = Some(controller::Controller::new(app));
+    });
+    let activation = Rc::clone(&controller);
+    app.connect_activate(move |_| {
+        if let Some(controller) = activation.borrow().as_ref() {
+            controller.show_settings();
+        }
+    });
+    app.connect_command_line(move |_, command_line| {
+        let options = command_line.options_dict();
+        let controller = controller.borrow();
+        let controller = controller.as_ref().expect("application started");
+        if options.contains("pair") {
+            controller.pair_tablet();
+        } else if options.contains("background") {
+            controller.start();
+        } else {
+            controller.show_settings();
+            if !options.contains("settings")
+                && !controller.is_enabled()
+                && controller.config.borrow().auto_connect
+            {
+                controller.start();
             }
-        });
-        app.add_action(&diagnostic);
-        window::build(app, engine, config);
+        }
+        glib::ExitCode::SUCCESS
     });
 
     app.run()
