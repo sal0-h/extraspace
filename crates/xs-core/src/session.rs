@@ -47,11 +47,21 @@ pub enum DisplayMode {
     Mirror,
 }
 
+/// Explicit transport selection for diagnostics; normal launches use `Auto`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportPreference {
+    #[default]
+    Auto,
+    Adb,
+    Wifi,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    pub transport: TransportPreference,
+    pub native_resolution: bool,
     pub mode: DisplayMode,
-    /// GNOME UI scale on the virtual monitor. Framebuffer size is the panel;
-    /// see [`virtual_size_for`].
+    /// UI scale; native resolution keeps the framebuffer at panel size.
     pub scale: f64,
     pub framerate: u32,
     pub bounds: BitrateBounds,
@@ -67,6 +77,8 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            transport: TransportPreference::Auto,
+            native_resolution: false,
             mode: DisplayMode::Extend,
             scale: 1.5,
             framerate: 60,
@@ -104,7 +116,7 @@ pub fn virtual_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32
 /// mutter only allows a logical size that is a whole number of pixels, so 1.75x on
 /// a 2304-wide panel is invalid (2304 / 1.75 = 1316.57) and would silently become
 /// a different scale. Trimming to 2296x1428 makes 1.75x exact at 1312x816 logical.
-/// Used with `XS_MUTTER_MODES=1`.
+/// Used by the native-resolution session path.
 pub fn scaled_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32, u32) {
     let scale = clamp_ui_scale(scale);
     // Every scale we offer is a multiple of a quarter, so scale = quarters / 4
@@ -122,9 +134,14 @@ pub fn scaled_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32,
 }
 
 /// Logical desktop size, i.e. how big the UI looks, for either sizing scheme.
-pub fn logical_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32, u32) {
+pub fn logical_size_for(
+    panel_width: u32,
+    panel_height: u32,
+    scale: f64,
+    native: bool,
+) -> (u32, u32) {
     let scale = clamp_ui_scale(scale);
-    if modes_enabled() {
+    if native {
         let (w, h) = scaled_size_for(panel_width, panel_height, scale);
         return (
             (w as f64 / scale).round() as u32,
@@ -132,14 +149,6 @@ pub fn logical_size_for(panel_width: u32, panel_height: u32, scale: f64) -> (u32
         );
     }
     virtual_size_for(panel_width, panel_height, scale)
-}
-
-/// Whether the panel-sized, GNOME-scaled monitor is opted into *and* safe.
-///
-/// Delegated so the size we compute cannot disagree with what the mutter session
-/// actually asks for.
-pub fn modes_enabled() -> bool {
-    xs_mutter::scaled_modes_allowed()
 }
 
 /// Sizes to advertise as extra, non-preferred modes on the virtual monitor.
@@ -246,7 +255,8 @@ pub async fn run(
     // the explicit request from either the window or the shell toggle.
     let mut accept_wireless = false;
     loop {
-        let allow_wifi = accept_wireless
+        let allow_wifi = config.transport != TransportPreference::Adb
+            && accept_wireless
             && match active.as_ref().map(|a| &a.transport).or(recovery.as_ref()) {
                 Some(target) => match target.kind() {
                     TransportKind::Adb => active.is_none() && !recovery_device_present,
@@ -322,7 +332,13 @@ pub async fn run(
                 if let Some(wireless) = &wireless {
                     wireless.set_accepting(false);
                 }
-                active = try_connect(&config, &events).await;
+                if config.transport == TransportPreference::Wifi {
+                    emit(State::Connecting {
+                        step: "Waiting for the paired tablet over Wi-Fi".into(),
+                    });
+                } else {
+                    active = try_connect(&config, &events).await;
+                }
             }
 
             Command::Disconnect => {
@@ -355,6 +371,19 @@ pub async fn run(
 
             Command::SetMode(mode) => {
                 config.mode = mode;
+                if let Some(session) = active.take() {
+                    recovery = Some(session.transport.clone());
+                    recovery_device_present = true;
+                    session.shutdown(false).await;
+                    retry_after = tokio::time::Instant::now() + TEARDOWN_SETTLE;
+                    if let Some(target) = &recovery {
+                        emit(waiting_state(target));
+                    }
+                }
+            }
+
+            Command::SetNativeResolution(native) => {
+                config.native_resolution = native;
                 if let Some(session) = active.take() {
                     recovery = Some(session.transport.clone());
                     recovery_device_present = true;
@@ -553,18 +582,22 @@ async fn connect(
     );
 
     let scale = clamp_ui_scale(config.scale);
-    let (asked_width, asked_height) = if modes_enabled() {
+    let native = config.mode == DisplayMode::Extend
+        && config.native_resolution
+        && xs_mutter::scaled_modes_supported();
+    let (asked_width, asked_height) = if native {
         scaled_size_for(hello.width, hello.height, scale)
     } else {
         virtual_size_for(hello.width, hello.height, scale)
     };
-    let (logical_width, logical_height) = logical_size_for(hello.width, hello.height, scale);
+    let (logical_width, logical_height) =
+        logical_size_for(hello.width, hello.height, scale, native);
     info!(
         width = asked_width,
         height = asked_height,
         scale,
         logical = format!("{logical_width}x{logical_height}"),
-        gnome_scaled = modes_enabled(),
+        gnome_scaled = native,
         "sizing the virtual monitor"
     );
 
@@ -584,6 +617,7 @@ async fn connect(
 
     let mutter = Arc::new(
         xs_mutter::Session::open(DisplayConfig {
+            native_scale: native,
             width: asked_width,
             height: asked_height,
             refresh_rate: config.framerate as f64,
@@ -604,7 +638,7 @@ async fn connect(
 
     step("Starting the video pipeline…");
     let start_kbps = starting_bitrate(width, height, config.framerate, config.bounds);
-    let (pipeline, mut frames, mut cursor_rx) = VideoPipeline::new(
+    let (pipeline, frames, mut cursor_rx) = VideoPipeline::new(
         mutter.node_id(),
         PipelineConfig {
             width,
@@ -666,10 +700,44 @@ async fn connect(
         let write_pace = Arc::clone(&write_pace);
         let connected = Arc::clone(&connected);
         let mut video_writer = FrameWriter::new(video);
+        // Explicit diagnostic opt-in: record exactly the access units sent to
+        // the tablet, privately, to distinguish encoder from decoder corruption.
+        let mut trace = if let Some(path) = std::env::var_os("EXTRASPACE_VIDEO_TRACE") {
+            use std::os::unix::fs::OpenOptionsExt;
+            Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?,
+            )
+        } else {
+            None
+        };
+        let test_stall_ms = std::env::var("EXTRASPACE_VIDEO_TEST_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(2000);
+        let test_stall_frame = std::env::var("EXTRASPACE_VIDEO_TEST_STALL_FRAME")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
         tasks.push(tokio::spawn(async move {
             let _closed = ConnectionClosed(connected);
             let mut last_start = Instant::now();
-            while let Some(frame) = frames.recv().await {
+            let mut sent = 0u64;
+            while let Ok(frame) = frames.recv().await {
+                if sent == test_stall_frame && test_stall_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(test_stall_ms)).await;
+                }
+                if let Some(file) = trace.as_mut() {
+                    if let Err(error) = std::io::Write::write_all(file, &frame.data) {
+                        warn!(%error, "video diagnostic write failed");
+                        trace = None;
+                    }
+                }
+                sent += 1;
                 let inter = last_start.elapsed();
                 last_start = Instant::now();
                 let flag = if frame.keyframe { flags::KEYFRAME } else { 0 };
@@ -813,7 +881,8 @@ async fn connect(
                         let elapsed = now.duration_since(last_sample_at).as_secs_f64().max(0.001);
                         last_sample_at = now;
 
-                        let total_dropped = dropped + device.frames_dropped;
+                        let host_dropped = dropped + pipeline_pace.raw_frames_dropped();
+                        let total_dropped = host_dropped + device.frames_dropped;
                         let rtt = Duration::from_micros(rtt_us.load(Ordering::Relaxed));
                         let sample = HealthSample {
                             decode_queue_depth: device.decode_queue_depth,
@@ -833,7 +902,7 @@ async fn connect(
                             queue = sample.decode_queue_depth,
                             drops = sample.dropped_delta,
                             rtt_ms = sample.rtt.as_millis() as u64,
-                            host_dropped = dropped,
+                            host_dropped,
                             device_dropped = device.frames_dropped,
                             encoded,
                             mutter_frames,
@@ -873,6 +942,21 @@ async fn connect(
                             frames_decoded: device.frames_decoded,
                             frames_dropped: total_dropped,
                             decode_queue_depth: device.decode_queue_depth,
+                            pacing: crate::PacingStats {
+                                capture_frames: capture.0,
+                                capture_gaps: capture.1,
+                                capture_max_gap_us: capture.2,
+                                encoded_gaps: encoded_pace.1,
+                                encoded_max_gap_us: encoded_pace.2,
+                                write_max_us: write.max_write_us,
+                                write_max_gap_us: write.max_inter_us,
+                                host_dropped,
+                                device_dropped: device.frames_dropped,
+                                encoded_bytes: bytes,
+                                keyframe_bytes: stats_source
+                                    .last_keyframe_bytes
+                                    .load(Ordering::Relaxed),
+                            },
                         }));
                     }
 
@@ -1078,6 +1162,37 @@ fn starting_bitrate(width: u32, height: u32, framerate: u32, bounds: BitrateBoun
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn wifi_only_waits_without_starting_an_adb_connection() {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (events, mut states) = broadcast::channel(8);
+        let session = run(
+            SessionConfig {
+                transport: TransportPreference::Wifi,
+                ..SessionConfig::default()
+            },
+            receiver,
+            events,
+            None,
+        );
+        let controls = async {
+            commands.send(Command::Connect).unwrap();
+            assert!(matches!(
+                states.recv().await.unwrap(),
+                Event::State(State::Idle)
+            ));
+            let event = tokio::time::timeout(Duration::from_secs(1), states.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, Event::State(State::Connecting { step }) if step.contains("Wi-Fi"))
+            );
+            commands.send(Command::Shutdown).unwrap();
+        };
+        tokio::join!(session, controls);
+    }
+
     #[test]
     fn missing_usb_does_not_block_native_wifi_waiting_state() {
         for error in [
@@ -1092,6 +1207,9 @@ mod tests {
     #[test]
     fn native_scale_streams_the_full_panel() {
         assert_eq!(virtual_size_for(2000, 1200, 1.0), (2000, 1200));
+        assert_eq!(logical_size_for(2304, 1440, 1.5, true), (1536, 960));
+        assert_eq!(logical_size_for(2304, 1440, 1.5, false), (1536, 960));
+        assert_eq!(logical_size_for(2304, 1440, 1.75, true), (1312, 816));
     }
 
     #[test]

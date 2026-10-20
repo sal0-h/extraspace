@@ -1,6 +1,7 @@
 package io.github.tymonoman.extraspace
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
@@ -73,21 +74,31 @@ class VideoDecoder(private val surface: Surface) {
         // idle -- which, since mutter only sends on damage, is most of the time --
         // the last frame sits decoded but unrendered until something else changes.
         drainThread = thread(name = "xs-decode-drain") { drainLoop() }
-        Log.i(TAG, "decoder started ${width}x$height low-latency=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.R}")
+        codec?.let { mc ->
+            val info = mc.codecInfo
+            val lowLatency = runCatching {
+                info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+            }.getOrDefault(false)
+            Log.i(TAG, "decoder started ${width}x$height name=${mc.name} hardware=${info.isHardwareAccelerated} low-latency-supported=$lowLatency")
+        }
     }
 
     /**
-     * Submits one access unit. Returns false if the codec could not accept it,
-     * which means we are behind and the frame is discarded.
+     * Submits one access unit. Backpressure preserves encoded reference frames;
+     * false means the connection must restart instead of continuing a broken GOP.
      */
     fun decode(data: ByteArray, length: Int, ptsUs: Long, isConfig: Boolean): Boolean {
         val mc = codec ?: return false
         return try {
-            // Short timeout rather than blocking: if the codec is saturated we
-            // would rather drop this frame than stall the socket reader and let
-            // even more frames pile up behind it.
+            // The drain thread frees input capacity. Wait briefly rather than
+            // dropping a P-frame that later frames may reference. The host drops
+            // stale raw frames before encoding when this backpressure reaches it.
             val waitStart = System.nanoTime()
-            val index = mc.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            var index = mc.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            while (index < 0 && running && System.nanoTime() - waitStart < INPUT_BUDGET_NS) {
+                index = mc.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            }
             if (index < 0) {
                 framesDropped.incrementAndGet()
                 return false
@@ -100,8 +111,8 @@ class VideoDecoder(private val surface: Surface) {
             val flags = if (isConfig) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
             // Do not pass the host GStreamer PTS through: it is a different
             // clock and Samsung MediaCodec will pace to it. 0 = "show now".
-            mc.queueInputBuffer(index, 0, length, 0, flags)
             pendingInputs.incrementAndGet()
+            mc.queueInputBuffer(index, 0, length, 0, flags)
             lastFramePtsUs.set(ptsUs)
             inputPace.observe("bytes=$length pts_us=$ptsUs wait_ms=$waitMs")
             true
@@ -158,6 +169,7 @@ class VideoDecoder(private val surface: Surface) {
     private companion object {
         const val TAG = "extraspace"
         const val INPUT_TIMEOUT_US = 10_000L
+        const val INPUT_BUDGET_NS = 250_000_000L
 
         /// Long enough that an idle desktop does not spin the CPU, short enough
         /// that shutdown is not noticeably delayed waiting for this to return.

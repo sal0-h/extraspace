@@ -300,9 +300,10 @@ pub struct Stats {
     pub decode_queue_depth: u32,
     pub frames_decoded: u64,
     pub frames_dropped: u64,
-    /// Device-side receive timestamp of the most recent frame, in `pts_us` terms.
+    /// Host PTS of the most recently submitted decoder input; not a device clock.
     pub last_frame_pts_us: u64,
-    /// Device clock when that frame was rendered, microseconds since boot.
+    /// Device clock when the last decoder output was released to its surface.
+    /// This is not proof that the panel displayed it or a match to last_frame_pts_us.
     pub rendered_at_us: u64,
 }
 

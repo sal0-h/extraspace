@@ -8,6 +8,10 @@ on the tablet. This research does not change the installed app's defaults.
 The [execution plan](sharpness-plan.md) sets the experiment order, measurements,
 and proposed acceptance targets.
 
+The [implementation and measured results](sharpness-results.md) record the
+subsequent native Wi-Fi trials, recovery fixes, and installed-app controls.
+The code observations below describe the research baseline, before those fixes.
+
 The user has deferred direct wireless and stylus support. Sleep/wake and roaming
 are unverified integration scenarios, not established failures. Keyboard
 passthrough and remote use over a VPN are outside the current priorities. Palm

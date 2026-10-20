@@ -5,6 +5,9 @@ paired Wi-Fi connection, with responsiveness close to today's 1536 × 960 mode.
 Keep the 1.5× UI size and normal Quick Settings / app-launcher workflow.
 This is a plan; no stream settings or installed binaries changed while writing it.
 
+See the subsequent [implementation results](sharpness-results.md) for the native
+Wi-Fi comparison, the recovery defects it exposed, and the implemented controls.
+
 The [research](sharpness-research.md) and [USB comparison](resolution-benchmark.md)
 already show that native 2304 × 1440 can sustain about 60 decoded FPS with a
 GPU-rendered fixture. Native resolution is the first candidate. A new codec is

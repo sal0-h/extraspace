@@ -92,7 +92,15 @@ Android draws that cursor over a `TextureView`, while MediaCodec handles video.
 Pointer movement therefore does not need to produce another encoded frame.
 
 Mutter produces frames when the desktop changes. Frame pacing drops excess
-frames instead of filling idle periods with duplicates. The Android decoder has
+raw frames instead of filling idle periods with duplicates. A one-frame encoded
+channel preserves H.264 reference frames and propagates backpressure to the
+leaky raw-input queue. Imported DMA-BUF memory retains its dequeued PipeWire
+buffer until downstream releases the pixels. Its destructor returns a generation
+token to the owning capture loop; removed buffers are never requeued. Pipeline
+shutdown closes the encoded channel before stopping
+GStreamer, waking a blocked encoder callback. Android also waits briefly for
+codec input capacity; a persistent stall reconnects rather than discarding a
+reference frame and continuing a broken prediction chain. The decoder has
 a separate output-drain thread so the final frame can render even when no new
 input arrives.
 
@@ -104,12 +112,16 @@ next keyframe and inflate its reported queue depth.
 
 ## Scaling and compositor guards
 
-The default path divides the tablet panel dimensions by the selected scale,
-rounds to even dimensions, and lets Android upscale the video.
+The app prefers Sharper, requesting a near-native framebuffer with a GNOME
+logical scale when the running compositor passes the compatibility check.
+Dimensions are trimmed so the logical size stays integral. The preference is
+part of `SessionConfig` and can change without restarting the app process;
+quality changes recreate the display while preserving its transport.
 
-With `XS_MUTTER_MODES=1`, a recorded patched Mutter build can instead create a
-near-native framebuffer and apply a GNOME logical scale. Dimensions are trimmed
-so the logical size stays integral.
+Standard, and the automatic fallback on an unsupported compositor, divide panel
+dimensions by the selected scale and let Android upscale the video. The legacy
+`XS_MUTTER_MODES` flag remains for standalone Mutter diagnostic examples, not
+the app's quality setting.
 
 `xs-mutter::patched` checks the recorded package version against pacman's local
 database and checks whether GNOME Shell is still using a replaced library.
@@ -134,12 +146,19 @@ sends touch events through real sockets. It exercises the host pipeline but does
 not verify USB transport or Android's decoder.
 
 `resolution_bench` uses the real tablet and emits JSON measurements. Close the
-desktop app first; `XS_BENCH_SECONDS` bounds the run. The current resolution
+desktop app first. It accepts `--resolution current|native`,
+`--transport auto|wifi|usb`, `--seconds`, and `--fixed-kbps`; a USB serial can be
+pinned with `--serial`. Camera forwarding is disabled. stdin accepts
+`mark NAME`, `snapshot NEW_DIRECTORY`, and `quit`. Timing begins when streaming,
+and stdin EOF does not prematurely end a trial. The earlier resolution
 decision and its measurement limits are in the
 [resolution benchmark](resolution-benchmark.md).
 
 See the [engineering notes](engineering-notes.md) for earlier hardware results
 and the capture, encoder, and ADB behavior that motivated this design.
+
+The [sharpness results](sharpness-results.md) document the native Wi-Fi
+comparison, recovery testing, and the limits of the timing measurements.
 
 ## Live color diagnostics
 

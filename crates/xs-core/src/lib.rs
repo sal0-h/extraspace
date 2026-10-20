@@ -18,9 +18,10 @@ mod session;
 
 pub use adaptive::{AdaptiveController, BitrateBounds, HealthSample};
 pub use session::{
-    clamp_ui_scale, fallback_sizes, logical_size_for, modes_enabled, scaled_size_for,
-    virtual_size_for, DisplayMode, SessionConfig,
+    clamp_ui_scale, fallback_sizes, logical_size_for, scaled_size_for, virtual_size_for,
+    DisplayMode, SessionConfig, TransportPreference,
 };
+pub use xs_mutter::scaled_modes_supported;
 pub use xs_transport::wireless::{PairedDevice, PairingOffer, Wireless, WirelessEvent};
 
 /// Events per second the tablet reports and the controller consumes.
@@ -37,6 +38,8 @@ pub enum Command {
     SetScale(f64),
     /// Switch between extending and mirroring.
     SetMode(DisplayMode),
+    /// Use full tablet pixels while preserving UI size and the current transport.
+    SetNativeResolution(bool),
     /// Change the quality envelope the adaptive controller works within.
     SetBitrateBounds(BitrateBounds),
     /// Start or stop camera passthrough.
@@ -89,6 +92,25 @@ pub struct Stats {
     pub frames_decoded: u64,
     pub frames_dropped: u64,
     pub decode_queue_depth: u32,
+    pub pacing: PacingStats,
+}
+
+/// Host stage observations for the latest health interval, not display latency.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PacingStats {
+    pub capture_frames: u64,
+    pub capture_gaps: u64,
+    pub capture_max_gap_us: u64,
+    pub encoded_gaps: u64,
+    pub encoded_max_gap_us: u64,
+    pub write_max_us: u64,
+    pub write_max_gap_us: u64,
+    /// Cumulative counters, unlike the interval maxima above.
+    pub host_dropped: u64,
+    pub device_dropped: u64,
+    pub encoded_bytes: u64,
+    /// Size of the most recent keyframe, not a cumulative counter.
+    pub keyframe_bytes: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     // an unpatched 50.4. 2296x1428 rather than the 2304x1440 panel because 1.75x
     // has to divide into whole logical pixels.
     let session = Session::open(DisplayConfig {
+        native_scale: xs_mutter::scaled_modes_allowed(),
         width: 2296,
         height: 1428,
         refresh_rate: 60.0,

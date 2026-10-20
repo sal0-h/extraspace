@@ -24,14 +24,17 @@ const PACMAN_LOCAL_DB: &str = "/var/lib/pacman/local";
 /// Requires `XS_MUTTER_MODES=1` *and* a mutter recorded as patched. Evaluated
 /// once, because it reads the filesystem and logs why it said no.
 pub fn scaled_modes_allowed() -> bool {
+    std::env::var_os("XS_MUTTER_MODES").is_some_and(|v| v == "1") && scaled_modes_supported()
+}
+
+/// Whether the running compositor supports native-resolution scaled monitors.
+/// User preference belongs to the session, not to this compatibility check.
+pub fn scaled_modes_supported() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| {
-        if std::env::var_os("XS_MUTTER_MODES").is_none_or(|v| v != "1") {
-            return false;
-        }
         if patched_mutter_is_running() {
             if let Some(installed) = installed_version() {
-                info!(mutter = %installed, "mutter is patched; using a scaled virtual monitor");
+                info!(mutter = %installed, "mutter is patched; native-resolution scaling is supported");
             }
             return true;
         }
@@ -40,7 +43,7 @@ pub fn scaled_modes_allowed() -> bool {
                 warn!(
                     "libmutter has been replaced since gnome-shell started, so the running \
                      compositor is still the unpatched one. Log out and back in; \
-                     XS_MUTTER_MODES is being ignored until then"
+                     native-resolution scaling is disabled until then"
                 );
                 false
             }
@@ -48,20 +51,18 @@ pub fn scaled_modes_allowed() -> bool {
                 warn!(
                     patched = %patched,
                     installed = %installed,
-                    "mutter changed since it was patched, so XS_MUTTER_MODES is being ignored. \
-                     Rebuild with packaging/mutter-patch/build-and-install.sh"
+                    "mutter changed since it was patched; native-resolution scaling is disabled"
                 );
                 false
             }
             (None, _) => {
                 warn!(
-                    "XS_MUTTER_MODES=1 but no patched mutter is recorded, so it is being ignored. \
-                     Asking stock mutter for a scaled mode logs you out"
+                    "no patched mutter is recorded; native-resolution scaling is disabled"
                 );
                 false
             }
             (_, None) => {
-                warn!("cannot tell which mutter is installed, so XS_MUTTER_MODES is being ignored");
+                warn!("cannot tell which mutter is installed; native-resolution scaling is disabled");
                 false
             }
         }

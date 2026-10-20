@@ -30,7 +30,7 @@ mod patched;
 mod proxies;
 
 pub use keys::Chord;
-pub use patched::scaled_modes_allowed;
+pub use patched::{scaled_modes_allowed, scaled_modes_supported};
 pub use proxies::CursorMode;
 use proxies::{
     RemoteDesktopProxy, RemoteDesktopSessionProxy, ScreenCastProxy, ScreenCastSessionProxy,
@@ -83,6 +83,8 @@ pub enum CaptureSource {
 
 #[derive(Debug, Clone)]
 pub struct DisplayConfig {
+    /// Request panel pixels with logical scaling, subject to compositor checks.
+    pub native_scale: bool,
     pub width: u32,
     pub height: u32,
     pub refresh_rate: f64,
@@ -100,6 +102,7 @@ pub struct DisplayConfig {
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
+            native_scale: scaled_modes_allowed(),
             width: 1920,
             height: 1080,
             refresh_rate: 60.0,
@@ -242,7 +245,9 @@ impl Session {
         // `preferred-scale`, and with it a native-resolution HiDPI monitor, is
         // only reachable through `modes`, so it needs a libmutter carrying the
         // NULL checks; see [`scaled_modes_allowed`].
-        let use_modes = scaled_modes_allowed();
+        let use_modes = matches!(config.source, CaptureSource::Virtual)
+            && config.native_scale
+            && scaled_modes_supported();
         let stream_path = match &config.source {
             CaptureSource::Virtual => {
                 let mut props: HashMap<&str, Value<'_>> = HashMap::from([

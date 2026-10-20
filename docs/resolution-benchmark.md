@@ -11,6 +11,9 @@ opportunities to reduce this cost. The GPU scrolling result below already
 reached approximately 60 FPS at native resolution; the earlier default decision
 does not establish a universal native-resolution limit.
 
+The later [native Wi-Fi work](sharpness-results.md) adds a Sharper setting and
+records both its measured performance and the recovery fixes required to use it.
+
 Both modes provide a 1536 × 960 desktop workspace. The current mode enlarges its
 video on the tablet; native mode uses GNOME fractional scaling and sends the
 panel's full pixel resolution.
@@ -83,6 +86,9 @@ calls the ping measurement a connection round trip.
 
 `cargo run --release -p xs-core --example resolution_bench` runs a real tablet
 session and emits JSON measurements. Close the desktop app before running it;
-`XS_MUTTER_MODES=1` selects native scaling when the compositor check passes.
+`-- --resolution native --transport wifi` selects native scaling and saved-pairing
+Wi-Fi when the compositor check passes. Use `--transport usb --serial SERIAL`
+for an explicit USB trial. The benchmark disables camera forwarding and leaves
+saved app settings unchanged.
 The experimental fixtures, raw logs, and screenshots were retained locally in
 `/tmp/extraspace-resolution-ex2pqc2e`; no desktop captures were committed.

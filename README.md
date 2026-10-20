@@ -140,23 +140,28 @@ Your saved settings remain in `~/.config/extraspace`.
 
 ## Display scaling
 
-The default scale is 1.5×. The normal path creates a smaller virtual framebuffer
-and lets the tablet upscale it. For a 2000×1200 panel:
+The default scale is 1.5×. **Image quality → Sharper** keeps the framebuffer near
+the tablet's full resolution and lets GNOME scale text and controls. It is the
+preferred setting when the compositor compatibility check passes. **Standard**
+uses a smaller framebuffer and lets the tablet enlarge it. For a 2304×1440 panel:
 
-| Scale | Stream resolution |
-|---|---|
-| 1× | 2000×1200 |
-| 1.5× | 1332×800 |
-| 2× | 1000×600 |
+| Scale | Standard stream | Sharper stream |
+|---|---|---|
+| 1× | 2304×1440 | 2304×1440 |
+| 1.25× | 1842×1152 | 2300×1440 |
+| 1.5× | 1536×960 | 2304×1440 |
+| 1.75× | 1316×822 | 2296×1428 |
+| 2× | 1152×720 | 2304×1440 |
 
-For sharper text, the optional native-panel path keeps the framebuffer near the
-tablet's full resolution and lets GNOME scale the UI. Dimensions may be trimmed
-slightly to keep logical pixels integral.
+The text size stays the same when changing quality. Some panel/scale combinations
+trim a few pixels to keep the logical dimensions integral. Quality changes
+preserve the current tablet and transport, just like scale changes.
 
-This path requires the [patched Mutter build](packaging/mutter-patch/README.md)
-and `XS_MUTTER_MODES=1`. Extraspace checks the installed patch marker and the
+Sharper requires the [patched Mutter build](packaging/mutter-patch/README.md).
+Extraspace checks the installed patch marker and the
 running compositor before enabling it. After a Mutter upgrade, it falls back to
-the default path until the patched build is restored.
+Standard until the patched build is restored. No environment flags are needed
+for normal app launches.
 
 ## Wi-Fi connection
 

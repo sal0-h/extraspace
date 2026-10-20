@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     println!("mirroring {connector} (of {connectors:?})");
 
     let session = xs_mutter::Session::open(DisplayConfig {
+        native_scale: false,
         width: 0,
         height: 0,
         refresh_rate: 60.0,

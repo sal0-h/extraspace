@@ -14,6 +14,7 @@ use xs_core::{BitrateBounds, DisplayMode};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub native_resolution: bool,
     /// GNOME UI scale on the native-pixel virtual monitor. 1.0 is tiny text.
     pub scale: f64,
     /// `"extend"` or `"mirror"`.
@@ -32,6 +33,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            native_resolution: true,
             // 1x is unreadable on a 10.4" panel; 1.5x is the sweet spot.
             scale: 1.5,
             mode: "extend".into(),
@@ -178,6 +180,7 @@ mod tests {
     fn config_roundtrips_through_json() {
         let c = Config {
             scale: 1.75,
+            native_resolution: false,
             mode: "mirror".into(),
             camera_enabled: true,
             ..Default::default()
@@ -185,6 +188,7 @@ mod tests {
         let text = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back.scale, 1.75);
+        assert!(!back.native_resolution);
         assert_eq!(back.display_mode(), DisplayMode::Mirror);
         assert!(back.camera_enabled);
     }
@@ -195,5 +199,6 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"scale": 2.0}"#).unwrap();
         assert_eq!(back.scale, 2.0);
         assert_eq!(back.framerate, 60);
+        assert!(back.native_resolution);
     }
 }

@@ -184,7 +184,9 @@ class MirrorActivity : ComponentActivity(), ConnectionManager.Callbacks {
         // and hopping to the main thread would only add latency.
         if (!foreground || decoder == null) return
         if (streamWidth == 0) return
-        decoder?.decode(data, length, ptsUs, isConfig)
+        if (decoder?.decode(data, length, ptsUs, isConfig) == false) {
+            throw java.io.IOException("Video decoder stalled; reconnecting for a fresh image")
+        }
         if (statusView.visibility == View.VISIBLE) showStatus(null)
     }
 

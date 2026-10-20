@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let session = xs_mutter::Session::open(DisplayConfig {
+        native_scale: xs_mutter::scaled_modes_allowed(),
         width,
         height,
         refresh_rate: FRAMERATE as f64,
@@ -67,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  pipewire node {}", session.node_id());
     let (width, height) = session.effective_size();
 
-    let (pipeline, mut frames, _cursor) = VideoPipeline::new(
+    let (pipeline, frames, _cursor) = VideoPipeline::new(
         session.node_id(),
         VideoConfig {
             width,
@@ -95,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
         match tokio::time::timeout(remaining, frames.recv()).await {
-            Ok(Some(frame)) => {
+            Ok(Ok(frame)) => {
                 if first_frame_at.is_none() {
                     first_frame_at = Some(started.elapsed());
                 }
@@ -106,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 stream.extend_from_slice(&frame.data);
             }
-            Ok(None) => {
+            Ok(Err(_)) => {
                 println!("  pipeline closed the channel early");
                 break;
             }

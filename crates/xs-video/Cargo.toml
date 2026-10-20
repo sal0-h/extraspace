@@ -16,6 +16,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+async-channel = "2.5"
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-allocators.workspace = true

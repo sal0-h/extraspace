@@ -26,9 +26,9 @@
 //! an idle screen costs almost no bandwidth -- but it means frame-count-based
 //! reasoning is unreliable: see the keyframe note below.
 //!
-//! Encoded frames leave through a bounded channel. If the transport cannot keep
-//! up, frames are dropped here rather than allowed to accumulate -- for a live
-//! display, a stale frame has no value.
+//! Encoded frames leave through a bounded channel. Backpressure reaches appsrc,
+//! which drops old *raw* frames before encoding. Discarding encoded reference
+//! frames breaks later P-frames and can leave an idle desktop corrupted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,8 +49,7 @@ pub use pacing::StagePace;
 /// `(frames, gaps, max_gap_us)` for one pipeline stage.
 pub type PaceWindow = (u64, u64, u64);
 
-/// Encoded frames buffered before we start dropping. One on purpose: a stale
-/// frame has no value, and a deeper queue is how a short stall becomes a hitch.
+/// Encoded frames buffered before backpressure reaches the raw-frame queue.
 const FRAME_QUEUE_DEPTH: usize = 1;
 
 /// Desktop RGB is full-range sRGB. Named so the converter does not have to guess.
@@ -267,6 +266,8 @@ pub struct VideoPipeline {
     capture: Mutex<Option<cursor::Capture>>,
     /// Set when frames should be requested as dma-bufs rather than copied.
     dmabuf: Option<cursor::DmaBufImport>,
+    /// Closing this wakes a blocked encoder callback before GStreamer teardown.
+    frame_sender: async_channel::Sender<EncodedFrame>,
 }
 
 impl VideoPipeline {
@@ -275,7 +276,11 @@ impl VideoPipeline {
     pub fn new(
         node_id: u32,
         config: VideoConfig,
-    ) -> Result<(Self, mpsc::Receiver<EncodedFrame>, mpsc::Receiver<()>)> {
+    ) -> Result<(
+        Self,
+        async_channel::Receiver<EncodedFrame>,
+        mpsc::Receiver<()>,
+    )> {
         gst::init()?;
 
         let encoder = select_encoder()?;
@@ -319,7 +324,8 @@ impl VideoPipeline {
 
         let kind = pipeline_kind();
         let encoder_element = encoder.build(config.bitrate_kbps, config.framerate)?;
-        let (tx, rx) = mpsc::channel(FRAME_QUEUE_DEPTH);
+        let (tx, rx) = async_channel::bounded(FRAME_QUEUE_DEPTH);
+        let frame_sender = tx.clone();
 
         match kind {
             PipelineKind::Full => {
@@ -375,7 +381,7 @@ impl VideoPipeline {
                 let appsink = AppSink::builder()
                     .name("frames")
                     .max_buffers(FRAME_QUEUE_DEPTH as u32)
-                    .drop(true)
+                    .drop(false)
                     .sync(false)
                     .build();
                 let encode_elements = [
@@ -427,17 +433,14 @@ impl VideoPipeline {
                                     .store(au_bytes as u64, Ordering::Relaxed);
                             }
                             sink_pace.observe(au_bytes, pts_us, keyframe.then_some("keyframe"));
-                            match tx.try_send(frame) {
-                                Ok(()) => {
-                                    sink_stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    sink_stats.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    return Err(gst::FlowError::Eos);
-                                }
+                            // Runs on GStreamer's streaming thread, never on the
+                            // capture or async control thread. Keep references
+                            // intact; appsrc's one-frame leaky queue discards
+                            // stale raw input when the network is slower.
+                            if tx.send_blocking(frame).is_err() {
+                                return Err(gst::FlowError::Eos);
                             }
+                            sink_stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
                             Ok(gst::FlowSuccess::Ok)
                         })
                         .build(),
@@ -546,6 +549,7 @@ impl VideoPipeline {
                 hub,
                 capture: Mutex::new(None),
                 dmabuf,
+                frame_sender,
             },
             rx,
             cursor_rx,
@@ -589,6 +593,7 @@ impl VideoPipeline {
     }
 
     pub fn stop(&self) {
+        self.frame_sender.close();
         if let Ok(mut capture) = self.capture.lock() {
             *capture = None;
         }
@@ -619,6 +624,16 @@ impl VideoPipeline {
 
     pub fn stats(&self) -> &Arc<VideoStats> {
         &self.stats
+    }
+
+    /// Raw frames superseded while the encoder/transport was backpressured.
+    /// The counter is available with GStreamer 1.28 and newer.
+    pub fn raw_frames_dropped(&self) -> u64 {
+        self.pipeline
+            .by_name("cursor-overlay")
+            .filter(|source| source.find_property("dropped").is_some())
+            .map(|source| source.property::<u64>("dropped"))
+            .unwrap_or(0)
     }
 
     /// `(capture, videorate, encoded)` window: each is `(frames, gaps, max_gap_us)`.
@@ -683,5 +698,79 @@ impl VideoPipeline {
 impl Drop for VideoPipeline {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backpressure_drops_raw_frames_and_stop_wakes_a_blocked_encoder() {
+        let (pipeline, frames, _cursor) = match VideoPipeline::new(
+            0,
+            VideoConfig {
+                width: 64,
+                height: 64,
+                framerate: 60,
+                bitrate_kbps: 2000,
+                scale: 1.0,
+            },
+        ) {
+            Ok(value) => value,
+            Err(Error::NoEncoder) => return,
+            Err(error) => panic!("could not build the test pipeline: {error}"),
+        };
+        // Exercise the production GStreamer chain with synthetic raw buffers,
+        // without creating a desktop monitor or starting PipeWire capture.
+        let source = pipeline
+            .pipeline
+            .by_name("cursor-overlay")
+            .unwrap()
+            .downcast::<AppSrc>()
+            .unwrap();
+        pipeline.pipeline.set_state(gst::State::Playing).unwrap();
+        let push = |number: u64| {
+            let mut frame = gst::Buffer::from_mut_slice(vec![(number * 13) as u8; 64 * 64 * 4]);
+            frame
+                .get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_mseconds(number * 34));
+            source.push_buffer(frame).unwrap();
+        };
+        push(0);
+        let first = tokio::time::timeout(Duration::from_secs(3), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.keyframe);
+        push(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frames.is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        push(2);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        for number in 3..30 {
+            push(number);
+        }
+        if source.find_property("dropped").is_some() {
+            assert!(pipeline.raw_frames_dropped() > 0);
+        }
+        assert_eq!(pipeline.stats().frames_dropped.load(Ordering::Relaxed), 0);
+        // Keep the receiver alive and full: stop must explicitly wake the
+        // callback, rather than relying on the consumer being dropped first.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || pipeline.stop()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(frames.is_closed());
     }
 }

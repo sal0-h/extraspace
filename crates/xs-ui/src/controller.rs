@@ -77,6 +77,15 @@ impl Controller {
             },
         );
         this.action("pair-tablet", None, |this, _| this.pair_tablet());
+        this.action(
+            "set-native-resolution",
+            Some(&bool::static_variant_type()),
+            |this, value| {
+                if let Some(native) = value.and_then(|v| v.get::<bool>()) {
+                    this.set_native_resolution(native);
+                }
+            },
+        );
         this.action("paired-devices", None, |this, _| {
             this.show_settings();
             if let Some(window) = this.window.borrow().as_ref() {
@@ -198,6 +207,16 @@ impl Controller {
         .into();
         self.config.borrow().save();
         self.engine.send(Command::SetMode(mode));
+        self.render();
+    }
+
+    pub fn set_native_resolution(&self, native: bool) {
+        if self.config.borrow().native_resolution == native {
+            return;
+        }
+        self.config.borrow_mut().native_resolution = native;
+        self.config.borrow().save();
+        self.engine.send(Command::SetNativeResolution(native));
         self.render();
     }
 

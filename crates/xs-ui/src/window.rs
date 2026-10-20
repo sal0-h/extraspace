@@ -36,6 +36,7 @@ struct Widgets {
     display_switch_handler: RefCell<Option<glib::SignalHandlerId>>,
     mode_row: adw::ComboRow,
     scale_row: adw::ComboRow,
+    quality_row: adw::ComboRow,
     camera_switch: adw::SwitchRow,
 
     stat_resolution: adw::ActionRow,
@@ -80,7 +81,10 @@ impl WindowUi {
                 0
             });
         self.widgets.camera_switch.set_active(config.camera_enabled);
-        update_scale_subtitle(&self.widgets, config.scale);
+        self.widgets
+            .quality_row
+            .set_selected(u32::from(config.native_resolution));
+        update_scale_subtitle(&self.widgets, config);
     }
 
     pub fn event(&self, event: &Event) {
@@ -223,6 +227,12 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         .model(&gtk::StringList::new(&scale_refs))
         .build();
     display_group.add(&scale_row);
+    let quality_row = adw::ComboRow::builder()
+        .title("Image quality")
+        .subtitle("Sharper uses the tablet’s full resolution")
+        .model(&gtk::StringList::new(&["Standard", "Sharper"]))
+        .build();
+    display_group.add(&quality_row);
     prefs.add(&display_group);
 
     let camera_group = adw::PreferencesGroup::builder()
@@ -270,6 +280,7 @@ fn build_content(window_title: adw::WindowTitle) -> (gtk::Widget, Widgets) {
         display_switch_handler: RefCell::new(None),
         mode_row,
         scale_row,
+        quality_row,
         camera_switch,
         stat_resolution,
         stat_connection,
@@ -330,7 +341,10 @@ fn wire_controls(widgets: &Rc<Widgets>, controller: &Rc<Controller>) {
                 0
             });
         widgets.camera_switch.set_active(c.camera_enabled);
-        update_scale_subtitle(widgets, c.scale);
+        widgets
+            .quality_row
+            .set_selected(u32::from(c.native_resolution));
+        update_scale_subtitle(widgets, &c);
     }
     let display = Rc::clone(controller);
     let handler = widgets.display_switch.connect_active_notify(move |row| {
@@ -356,6 +370,10 @@ fn wire_controls(widgets: &Rc<Widgets>, controller: &Rc<Controller>) {
         });
     });
     let camera = Rc::clone(controller);
+    let quality = Rc::clone(controller);
+    widgets.quality_row.connect_selected_notify(move |row| {
+        quality.set_native_resolution(row.selected() == 1);
+    });
     widgets
         .camera_switch
         .connect_active_notify(move |row| camera.set_camera(row.is_active()));
@@ -365,15 +383,27 @@ fn wire_controls(widgets: &Rc<Widgets>, controller: &Rc<Controller>) {
         .connect_clicked(move |_| connect.start());
 }
 
-fn update_scale_subtitle(widgets: &Rc<Widgets>, scale: f64) {
-    let description = if xs_core::modes_enabled() {
-        "GNOME scale at panel resolution"
+fn update_scale_subtitle(widgets: &Rc<Widgets>, config: &Config) {
+    let available = xs_core::scaled_modes_supported();
+    let mirror = config.display_mode() == DisplayMode::Mirror;
+    widgets.quality_row.set_sensitive(available && !mirror);
+    widgets.quality_row.set_subtitle(if mirror {
+        "Image resolution follows the mirrored display"
+    } else if !available {
+        "Sharper is unavailable on this system; using Standard"
+    } else {
+        "Sharper uses the tablet’s full resolution"
+    });
+    let description = if mirror {
+        "follows the mirrored display"
+    } else if config.native_resolution && available {
+        "full resolution, with larger text and controls"
     } else {
         "smaller video frame, enlarged on the tablet"
     };
     widgets
         .scale_row
-        .set_subtitle(&format!("{scale}× — {description}"));
+        .set_subtitle(&format!("{}× — {description}", config.scale));
 }
 
 fn apply_state(widgets: &Rc<Widgets>, state: &State, enabled: bool) {

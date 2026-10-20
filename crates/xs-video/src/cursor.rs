@@ -12,6 +12,9 @@
 //! tablet can composite an overlay. A cursor-only buffer therefore costs a
 //! sprite/position message, not a convert+encode+USB cycle.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -92,6 +95,9 @@ struct CaptureData {
     /// The layout requested from mutter, when frames should arrive as dma-bufs.
     dmabuf: Option<DmaBufImport>,
     allocator: Option<gstreamer_allocators::DmaBufAllocator>,
+    return_buffers: pw::channel::Sender<(usize, u64)>,
+    live_buffers: Rc<RefCell<HashMap<usize, u64>>>,
+    next_buffer_id: u64,
 }
 
 impl CursorHub {
@@ -472,6 +478,20 @@ fn run_capture_stream(
     let stream = pw::stream::StreamBox::new(&core, "extraspace-capture", props)
         .map_err(|e| e.to_string())?;
 
+    let (return_tx, return_rx) = pw::channel::channel::<(usize, u64)>();
+    let live_buffers = Rc::new(RefCell::new(HashMap::new()));
+    let live = Rc::clone(&live_buffers);
+    let stream_ptr = stream.as_raw_ptr();
+    // The IO source is removed before stream is dropped. Requeue on this
+    // owning loop, never directly from a GStreamer worker/destructor thread.
+    let _return_source = return_rx.attach(mainloop.loop_(), move |(buffer, generation)| {
+        if live.borrow().get(&buffer) == Some(&generation) {
+            unsafe {
+                pw_sys::pw_stream_queue_buffer(stream_ptr, buffer as *mut pw_sys::pw_buffer);
+            }
+        }
+    });
+
     let dequeue_only = std::env::var("EXTRASPACE_PIPELINE")
         .map(|v| v == "dequeue")
         .unwrap_or(false);
@@ -486,10 +506,22 @@ fn run_capture_stream(
         dequeue_only,
         dmabuf: dmabuf.clone(),
         allocator,
+        return_buffers: return_tx,
+        live_buffers,
+        next_buffer_id: 0,
     };
 
     let _listener = stream
         .add_local_listener_with_user_data(data)
+        .add_buffer(|_, data, buffer| {
+            data.next_buffer_id += 1;
+            data.live_buffers
+                .borrow_mut()
+                .insert(buffer as usize, data.next_buffer_id);
+        })
+        .remove_buffer(|_, data, buffer| {
+            data.live_buffers.borrow_mut().remove(&(buffer as usize));
+        })
         .state_changed(|_, _, old, new| {
             if matches!(new, pw::stream::StreamState::Error(_)) {
                 warn!(?old, ?new, "screen-cast stream error");
@@ -544,6 +576,9 @@ fn run_capture_stream(
                     let height = data.format.size().height;
                     data.hub
                         .on_dmabuf_frame(buffer, width, height, &import.drm_format(), stride);
+                    // The GstMemory lease returns this buffer only after the
+                    // converter has finished with its pixels.
+                    return;
                 }
             } else {
                 let copied = std::time::Instant::now();
@@ -898,9 +933,9 @@ unsafe fn video_chunk_size(pw_buf: *mut pw_sys::pw_buffer) -> u32 {
 
 /// Wraps a dma-buf frame as a GStreamer buffer without touching the pixels.
 ///
-/// The fd is duplicated so the PipeWire buffer can be requeued immediately;
-/// GStreamer closes its copy when the buffer is released, and the underlying
-/// GEM object stays alive as long as either fd is open.
+/// A duplicated fd keeps the allocation alive, but does not stop the producer
+/// overwriting its pixels. The GstMemory lease retains the dequeued PipeWire
+/// buffer until downstream releases the memory, including across buffer copies.
 unsafe fn wrap_dmabuf_frame(
     pw_buf: *mut pw_sys::pw_buffer,
     data: &mut CaptureData,
@@ -925,6 +960,7 @@ unsafe fn wrap_dmabuf_frame(
         return None;
     }
     let allocator = data.allocator.as_ref()?;
+    let generation = *data.live_buffers.borrow().get(&(pw_buf as usize))?;
     let owned = match unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned() {
         Ok(owned) => owned,
         Err(e) => {
@@ -968,7 +1004,33 @@ unsafe fn wrap_dmabuf_frame(
             return None;
         }
     }
+    // Attach only after all fallible setup: failures are requeued by process().
+    let return_buffers = data.return_buffers.clone();
+    let token = (pw_buf as usize, generation);
+    release_with_memory(buffer.peek_memory(0), move || {
+        let _ = return_buffers.send(token);
+    });
     Some(buffer)
+}
+
+/// Attach ownership to the memory, so a shallow GstBuffer copy cannot release
+/// the PipeWire pixels while another header still refers to them.
+fn release_with_memory<F: FnOnce() + Send + 'static>(memory: &gst::MemoryRef, release: F) {
+    unsafe extern "C" fn destroy<F: FnOnce()>(data: gst::glib::ffi::gpointer) {
+        let release = unsafe { Box::<F>::from_raw(data.cast()) };
+        release();
+    }
+    unsafe {
+        let key = gst::glib::ffi::g_quark_from_static_string(
+            c"extraspace-pipewire-buffer-lease".as_ptr(),
+        );
+        gst::ffi::gst_mini_object_set_qdata(
+            memory.as_mut_ptr().cast(),
+            key,
+            Box::into_raw(Box::new(release)).cast(),
+            Some(destroy::<F>),
+        );
+    }
 }
 
 unsafe fn copy_video_frame(
@@ -1142,6 +1204,25 @@ fn argb_to_bgrx(src: &[u8], dest: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_gst_memory_retains_the_capture_lease() {
+        gst::init().unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let notify = Arc::clone(&released);
+        let memory = gst::Memory::from_mut_slice(vec![0u8; 16]);
+        release_with_memory(&memory, move || {
+            notify.store(true, Ordering::SeqCst);
+        });
+        let mut first = gst::Buffer::new();
+        first.get_mut().unwrap().append_memory(memory.clone());
+        let mut second = gst::Buffer::new();
+        second.get_mut().unwrap().append_memory(memory);
+        drop(first);
+        assert!(!released.load(Ordering::SeqCst));
+        drop(second);
+        assert!(released.load(Ordering::SeqCst));
+    }
 
     fn test_hub() -> (Arc<CursorHub>, mpsc::Receiver<()>) {
         let (tx, rx) = mpsc::channel(1);

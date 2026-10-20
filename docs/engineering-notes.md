@@ -93,6 +93,16 @@ Things that cost time, recorded so they cost you less:
   but unrendered until something else changes. A dedicated drain thread fixed both
   that and the queue-depth telemetry, which had been reporting a stuck 6–8 and
   driving the bitrate to the floor for entire sessions.
+- **Drop stale raw frames before encoding.** An encoded P-frame can be a reference
+  for the next frame. Discarding it from a full output queue caused blocks to
+  remain on a static native-resolution page until another keyframe arrived.
+  The encoded channel now preserves references and propagates backpressure to
+  the one-frame leaky raw queue. Decoder input saturation also waits briefly,
+  then reconnects if necessary, rather than silently losing a reference.
+- **A duplicated DMA-BUF fd does not preserve the frame's contents.** It keeps
+  the allocation alive, while returning the PipeWire buffer permits the producer
+  to overwrite it. Imported GStreamer memory now retains the capture buffer
+  until its last reference is released, then asks the owning loop to recycle it.
 - **"60 fps" is a ceiling, not a rate.** Mutter only emits a frame when something
   on the monitor actually changes, so a still desktop measures around **11 fps**
   and well under 1 Mbit/s. That is exactly what you want — an idle screen should

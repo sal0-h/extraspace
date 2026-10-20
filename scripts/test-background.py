@@ -89,10 +89,14 @@ if [ "$*" = "devices -l" ]; then printf 'List of devices attached\\n'; else exit
 
         action('set-scale', GLib.Variant('d', 1.25))
         action('set-mode', GLib.Variant('s', 'mirror'))
+        action('set-native-resolution', GLib.Variant('b', False))
         config_file = root / 'config' / 'extraspace' / 'config.json'
         wait(lambda: config_file.exists(), 'Settings did not persist')
         saved = json.loads(config_file.read_text())
         assert saved['scale'] == 1.25 and saved['mode'] == 'mirror'
+        assert not saved['native_resolution']
+        action('set-native-resolution', GLib.Variant('b', True))
+        wait(lambda: json.loads(config_file.read_text())['native_resolution'], 'Sharper preference did not persist')
         assert not state('window-visible'), 'Changing settings created a window'
         action('set-display', GLib.Variant('b', False))
         stopped(p)
