@@ -6,6 +6,11 @@ about 4–5 ms to the host video pipeline and substantially slows the CPU-drawn
 workload. It is a useful option for reading; it is not a consistent improvement
 for a desktop where responsiveness matters.
 
+The [October 19 sharpness research](sharpness-research.md) records follow-up
+opportunities to reduce this cost. The GPU scrolling result below already
+reached approximately 60 FPS at native resolution; the earlier default decision
+does not establish a universal native-resolution limit.
+
 Both modes provide a 1536 × 960 desktop workspace. The current mode enlarges its
 video on the tablet; native mode uses GNOME fractional scaling and sends the
 panel's full pixel resolution.
