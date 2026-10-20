@@ -5,6 +5,9 @@ The target is sharper text with an interactive feel close to the current mode.
 The candidates below have not been demonstrated to improve end-to-end latency
 on the tablet. This research does not change the installed app's defaults.
 
+The [execution plan](sharpness-plan.md) sets the experiment order, measurements,
+and proposed acceptance targets.
+
 The user has deferred direct wireless and stylus support. Sleep/wake and roaming
 are unverified integration scenarios, not established failures. Keyboard
 passthrough and remote use over a VPN are outside the current priorities. Palm
