@@ -1,5 +1,9 @@
 # Wireless ADB comparison
 
+Historical test of Android Wireless debugging, before native Extraspace Wi-Fi
+pairing. These results compare network behavior through ADB, not the current
+TLS transport. For normal connections, use the [Wi-Fi guide](../usage.md#wi-fi).
+
 This comparison checked whether the tablet can stream over Android's secure
 wireless debugging connection at the same 1536×960 resolution and 60 Hz used
 over USB. The test ran twice per transport in USB, Wi-Fi, Wi-Fi, USB order with
@@ -26,12 +30,12 @@ results describe one tablet and one local network; they do not predict other
 routers or interference conditions. Camera forwarding was disabled during the
 comparison.
 
-To choose a paired Wi-Fi device while USB is attached, launch Extraspace with
-the Wi-Fi serial shown by `adb devices`:
+The test selected wireless ADB while USB was attached using the serial shown
+by `adb devices`:
 
 ```bash
 ANDROID_SERIAL=TABLET_IP:CONNECTION_PORT extraspace
 ```
 
-If the selected Wi-Fi connection is unavailable, Extraspace reports an error
-instead of silently switching back to USB.
+This ADB selection is separate from native saved pairing. Current native Wi-Fi
+measurements are in the [sharpness benchmark](../benchmarks/sharpness.md).

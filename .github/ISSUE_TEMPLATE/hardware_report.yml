@@ -1,5 +1,5 @@
-name: It worked (or half worked) on my hardware
-description: Report a tablet or GNOME version that is not the one this was built on
+name: Hardware compatibility
+description: Report compatibility with a tablet and GNOME setup
 labels: [hardware-report]
 title: "Hardware report: "
 body:
@@ -65,10 +65,9 @@ body:
   - type: textarea
     id: notes
     attributes:
-      label: Anything worth noting
+      label: Test details
       description: |
-        Measured latency, encoder chosen, anything that needed changing to make
-        it work. If a setting had to be different from the default, that is the
-        most useful thing here.
+        Include USB or native Wi-Fi, encoder, scale, image quality, and any
+        settings needed to make it work. Add measurements if available.
     validations:
       required: false

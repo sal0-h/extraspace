@@ -1,8 +1,10 @@
-# Upstream bug report
+# Filed Mutter crash report
 
-Filed 2026-08-26 as https://gitlab.gnome.org/GNOME/mutter/-/issues/5007,
-"Screen-cast virtual monitor dereferences an unassigned CRTC config, crashing
-gnome-shell". What follows is what was filed, kept here as the record.
+Filed August 26, 2026, as
+[GNOME/mutter#5007](https://gitlab.gnome.org/GNOME/mutter/-/issues/5007),
+“Screen-cast virtual monitor dereferences an unassigned CRTC config, crashing
+gnome-shell”. The report body below is preserved as filed. For the local
+package and follow-up stage-view guards, see the [patch guide](README.md).
 
 ---
 

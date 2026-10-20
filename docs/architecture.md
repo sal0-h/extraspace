@@ -1,17 +1,18 @@
 # Architecture
 
 Extraspace has a Rust host and a Kotlin Android companion. The host creates or
-captures a GNOME display, encodes its frames, and sends them through three
-independent channels over USB or authenticated Wi-Fi. The tablet decodes video, renders the cursor, and sends
-touch events and optional camera frames back.
+captures a GNOME display and sends H.264 video and cursor metadata. The tablet
+decodes video, draws the cursor, and returns touch input and optional camera
+video. Control, display video, and camera video use separate framed channels
+over ADB or native authenticated Wi-Fi.
 
 ```mermaid
 flowchart LR
     GNOME["GNOME / Mutter"] -->|PipeWire frames| VIDEO["Rust / GStreamer"]
-    VIDEO -->|H.264 over USB| TABLET["Android / MediaCodec"]
-    VIDEO -->|Cursor metadata over USB| CURSOR["Android cursor overlay"]
-    TABLET -->|Touch over USB| GNOME
-    TABLET -->|Camera H.264 over USB| CAMERA["Rust / GStreamer"]
+    VIDEO -->|H.264| TABLET["Android / MediaCodec"]
+    GNOME -->|Cursor metadata via host| TABLET
+    TABLET -->|Touch via host| GNOME
+    TABLET -->|Camera H.264| CAMERA["Rust / GStreamer"]
     CAMERA --> WEBCAM["Linux /dev/video10"]
 ```
 
@@ -19,152 +20,169 @@ flowchart LR
 
 | Crate | Responsibility |
 |---|---|
-| `xs-proto` | Frame headers and message definitions, mirrored by Android's `Protocol.kt` |
-| `xs-mutter` | Display creation, monitor layouts, input injection, and the patched-Mutter check |
+| `xs-proto` | Frame headers and messages, mirrored by Android's `Protocol.kt` |
+| `xs-mutter` | Display creation, monitor layouts, input injection, and compositor checks |
 | `xs-video` | PipeWire capture, cursor metadata, frame pacing, and H.264 encoding |
-| `xs-transport` | ADB orchestration, companion installation, and framed sockets |
-| `xs-camera` | Decode the tablet camera stream into a V4L2 loopback device |
-| `xs-core` | Session lifecycle and adaptive bitrate control |
-| `xs-ui` | Application lifetime, exported controls, optional GTK settings, and persisted settings |
+| `xs-transport` | ADB orchestration, companion installation, native Wi-Fi, and framed sockets |
+| `xs-camera` | Decode tablet camera video into a V4L2 loopback device |
+| `xs-core` | Session lifecycle, recovery, telemetry, and adaptive bitrate |
+| `xs-ui` | Application lifetime, exported controls, GTK settings, and persistence |
 
-## Background application and Quick Settings
+## Application lifetime
 
-`xs-ui::controller` owns one engine and cached session/telemetry state. Controls
-are exported as GApplication actions on the session bus at
-`io.github.tymonoman.Extraspace`, `/io/github/tymonoman/Extraspace`.
-`set-display`, `set-scale`, `set-mode`, and the pairing actions work without a
-settings window. Read-only `display-enabled` and `session-state` actions expose
-requested display use and actual connection state separately.
+`xs-ui::controller` owns the engine and cached session state. It exports
+GApplication actions on the session bus at `io.github.tymonoman.Extraspace`,
+`/io/github/tymonoman/Extraspace`. Display, scale, mode, image quality, and
+pairing controls work without a settings window. Read-only `display-enabled`
+and `session-state` actions distinguish the requested state from the actual
+connection state.
 
-The GNOME 51 extension in `extension/` watches that bus name and action changes.
-Its tile uses installed desktop actions to start the process on demand. It has
-no idle polling timer and never runs video or networking code inside Shell.
-`--background` starts the display without constructing a window; `--settings`
-opens settings without starting the display; `--pair` opens pairing and enables
-connections. Ordinary launches retain the window and auto-connect behavior.
+The GNOME 51 extension watches the bus name and action changes. It starts the
+host through installed desktop actions and has no idle polling timer. Video
+and networking run in the host process, outside GNOME Shell.
 
-Closing settings hides it while the display is enabled. When disabled, closing
-settings quits. Off and Quit wait for engine shutdown and then exit the process,
-releasing capture, sockets, and discovery. A settings-only process rejects
-incoming Wi-Fi data channels until Connect is requested; pairing remains explicit.
+| Launch | Behavior |
+|---|---|
+| Ordinary launch | Open the window and use the saved auto-connect preference |
+| `--background` | Start the display without constructing a window |
+| `--settings` | Open settings without starting the display |
+| `--pair` | Open pairing and enable connections |
 
-The hardware-free lifecycle check uses a private bus and a virtual display:
-
-```bash
-GSETTINGS_BACKEND=memory GSK_RENDERER=cairo GTK_A11Y=none \
-  dbus-run-session -- xvfb-run -a python3 scripts/test-background.py target/release/extraspace
-node extension/tests/state.mjs
-```
+Closing settings keeps an enabled display running. When the display is off,
+closing settings quits. Off and Quit wait for engine shutdown before exiting,
+releasing capture, sockets, and discovery. A settings-only host rejects incoming
+Wi-Fi data channels until the display is enabled.
 
 ## GNOME session setup
 
 For an extended display, the host:
 
-1. Creates a RemoteDesktop session and reads its session ID.
-2. Creates a ScreenCast session linked to that RemoteDesktop session. This link
-   makes injected touch coordinates relative to the captured stream.
+1. Creates a RemoteDesktop session and reads its ID.
+2. Creates a ScreenCast session linked to RemoteDesktop, making injected touch
+   coordinates relative to the captured stream.
 3. Calls `RecordVirtual` with `is-platform: true` and cursor metadata enabled.
-4. Subscribes to `PipeWireStreamAdded` before starting the RemoteDesktop session.
-5. Connects the capture pipeline to the PipeWire node, then finalizes the virtual
-   monitor's layout.
+4. Subscribes to `PipeWireStreamAdded`, then starts RemoteDesktop.
+5. Connects capture to the PipeWire node and finalizes the monitor layout.
 
-A linked session starts through RemoteDesktop. Starting ScreenCast directly is
-rejected by Mutter. Closing the virtual display restores the physical monitor
-layout while preserving changes made during the session.
+Mutter rejects starting a linked session through ScreenCast directly. Closing
+the virtual display restores physical monitor layouts while preserving changes
+made during the session. Mirror mode records an existing monitor instead.
 
-Mirror mode records an existing monitor instead of creating a virtual one.
+## Video and cursor
 
-## Capture and rendering
-
-The preferred capture path requests DMA-BUF frames and passes GPU-backed buffers
-through GStreamer to a VA-API encoder:
+The preferred path imports GPU-backed PipeWire buffers into a VA-API pipeline:
 
 ```text
-PipeWire -> appsrc -> drop-only frame pacing -> vapostproc -> VA-API H.264 -> USB
+PipeWire DMA-BUF -> appsrc -> drop-only pacing -> vapostproc -> VA-API H.264 -> transport
 ```
 
-When GPU encoding is unavailable, the host uses copied frames with
-`videoconvert` and x264 or OpenH264. Encoder bitrate units are normalized in
-`xs-video::encoder`.
+The software path copies frames and uses `videoconvert` with x264 or OpenH264.
+`xs-video::encoder` normalizes their different bitrate units. Android decodes
+through MediaCodec into a `TextureView` and draws the cursor as an overlay.
+Cursor updates travel on the control channel without requiring another video
+frame.
 
-Cursor position and bitmap metadata travel separately on the control channel.
-Android draws that cursor over a `TextureView`, while MediaCodec handles video.
-Pointer movement therefore does not need to produce another encoded frame.
+Capture follows desktop changes. Excess raw frames can be dropped before
+encoding; idle periods do not generate duplicate frames. The bounded encoded
+channel preserves H.264 references and propagates backpressure to the one-frame
+leaky raw-input queue. Shutdown closes the encoded channel before stopping
+GStreamer so a blocked encoder callback can exit.
 
-Mutter produces frames when the desktop changes. Frame pacing drops excess
-raw frames instead of filling idle periods with duplicates. A one-frame encoded
-channel preserves H.264 reference frames and propagates backpressure to the
-leaky raw-input queue. Imported DMA-BUF memory retains its dequeued PipeWire
-buffer until downstream releases the pixels. Its destructor returns a generation
-token to the owning capture loop; removed buffers are never requeued. Pipeline
-shutdown closes the encoded channel before stopping
-GStreamer, waking a blocked encoder callback. Android also waits briefly for
-codec input capacity; a persistent stall reconnects rather than discarding a
-reference frame and continuing a broken prediction chain. The decoder has
-a separate output-drain thread so the final frame can render even when no new
-input arrives.
+Imported DMA-BUF memory retains its dequeued PipeWire buffer until the last
+GStreamer memory reference is released. The destructor sends a generation token
+to the capture loop, which requeues only buffers that still belong to the
+stream. Duplicating a file descriptor alone would not prevent pixel reuse.
 
-The video socket waits until `MediaCodec.start()` completes before delivering its
-first access unit. Control configuration is posted to Android's main thread;
-receiving `VideoConfig` on the control socket alone does not mean the decoder is
-ready. Losing the first SPS/PPS and keyframe can leave the decoder waiting for the
-next keyframe and inflate its reported queue depth.
+The video socket waits for `MediaCodec.start()` before delivering its first
+access unit. Android drains output on a separate thread, including when no new
+input arrives. Input saturation waits briefly for capacity; a persistent stall
+reconnects with a fresh decoder rather than losing an encoded reference frame.
 
-## Scaling and compositor guards
+## Scaling and compositor checks
 
-The app prefers Sharper, requesting a near-native framebuffer with a GNOME
-logical scale when the running compositor passes the compatibility check.
-Dimensions are trimmed so the logical size stays integral. The preference is
-part of `SessionConfig` and can change without restarting the app process;
-quality changes recreate the display while preserving its transport.
+In Extend mode, Sharper requests a near-native framebuffer with GNOME logical
+scaling. Dimensions are trimmed to make logical sizes integral. The
+`SessionConfig.native_resolution` preference is independent of the selected
+scale. Quality, mode, and scale changes recreate the display while retaining
+the selected tablet and transport.
 
-Standard, and the automatic fallback on an unsupported compositor, divide panel
-dimensions by the selected scale and let Android upscale the video. The legacy
-`XS_MUTTER_MODES` flag remains for standalone Mutter diagnostic examples, not
-the app's quality setting.
+Standard divides panel dimensions by the scale and lets Android enlarge the
+video. Mirror mode uses the captured monitor's dimensions. The app falls back
+to Standard when `scaled_modes_supported()` cannot verify the patched
+compositor. The legacy `XS_MUTTER_MODES=1` flag applies only to standalone
+Mutter diagnostic examples.
 
-`xs-mutter::patched` checks the recorded package version against pacman's local
-database and checks whether GNOME Shell is still using a replaced library.
-Without a matching patch marker, scaled modes remain disabled. The patches,
-installation hook, and rollback instructions live in
-[packaging/mutter-patch](../packaging/mutter-patch/README.md).
+The compatibility check compares the recorded patch marker with pacman's local
+database and looks for a replaced library still mapped by GNOME Shell. See
+[patch installation and rollback](../packaging/mutter-patch/README.md).
+
+## Native Wi-Fi and trust
+
+The host listens on TCP port 47471, using an available port if occupied, and
+advertises `_extraspace._tcp.local.` through DNS-SD. Android discovers it with
+NSD and also tries its last working endpoint. The tablet opens three TLS 1.3
+connections for control, video, and camera. USB and Wi-Fi share framing and
+codec behavior.
+
+The GUI enables pairing for five minutes with a one-use 100-bit code, displayed
+as five groups of four characters and as a QR code. The QR includes certificate
+fingerprint and endpoint information. Manual entry discovers candidates without
+trusting their advertisements. Pairing uses HMAC-SHA256 proofs over the server
+certificate fingerprint and fresh nonces, with separate client/server domains.
+The code itself is not sent over the network.
+
+Android verifies the server proof before releasing a random 256-bit credential;
+the host verifies the client proof before saving its hash. Later channels must
+present that credential inside TLS, and Android pins the saved certificate.
+Android encrypts its credential with an app-specific Android Keystore AES-GCM
+key. The host stores its certificate, private key, and approved credential
+hashes in `~/.config/extraspace/wireless.json`, respecting `XDG_CONFIG_HOME`,
+with 0600 file and 0700 directory permissions.
+
+Updates retain trust. Forgetting a device removes trust and closes its active
+session. Native Wi-Fi uses no ADB service or cloud relay. Transport tests cover
+real TLS, unknown credentials, persistence, three-channel assembly, and
+revocation. Roaming and sleep/wake remain unverified integration scenarios.
+
+## Android lifecycle and reconnects
+
+`onStart` creates discovery and local USB listeners. `onStop` closes discovery,
+in-flight TLS attempts, channels, decoder, and camera; it releases the multicast
+lock and removes timers. Saved credentials remain on disk. Generation guards
+reject callbacks from previous sessions, including connections completing after
+Home. QR scan results wait until the display activity resumes.
+
+USB teardown shuts down blocked accepts before closing file descriptors.
+Binding happens off the main thread with a short retry window. Each connection
+reports disconnect once, and generation guards prevent stale channel closures
+from tearing down a replacement connection. The host returns to waiting after
+a control disconnect while the visible tablet app retries.
+
+Touch and health reports use a bounded output worker, keeping TLS writes off
+Android's main thread. The worker stops when the activity is hidden. The screen
+stays awake only while connected. USB can explicitly launch the activity through
+ADB; native Wi-Fi cannot wake a hidden app.
 
 ## Integration examples
 
-Unit tests need neither a tablet nor GNOME. These manual examples require an
-active GNOME Wayland session and exercise real capture or virtual displays:
+These commands require an active GNOME Wayland session:
 
 ```bash
 cargo run -p xs-core --example fake_tablet
-cargo run --release -p xs-core --example resolution_bench
+cargo run --release -p xs-core --example resolution_bench -- --help
 cargo run -p xs-video --example capture_test
 cargo run -p xs-mutter --example virtual_monitor
 ```
 
-`fake_tablet` performs the handshake, consumes video, reports decoder health, and
-sends touch events through real sockets. It exercises the host pipeline but does
-not verify USB transport or Android's decoder.
+`fake_tablet` handshakes, consumes video, reports decoder health, and sends touch
+through real sockets. It does not verify USB or Android decoding.
+`resolution_bench` uses a real tablet; see [benchmark reproduction](benchmarks/sharpness.md#reproduction).
+Hardware-free lifecycle checks are in [Contributing](../CONTRIBUTING.md#checks).
 
-`resolution_bench` uses the real tablet and emits JSON measurements. Close the
-desktop app first. It accepts `--resolution current|native`,
-`--transport auto|wifi|usb`, `--seconds`, and `--fixed-kbps`; a USB serial can be
-pinned with `--serial`. Camera forwarding is disabled. stdin accepts
-`mark NAME`, `snapshot NEW_DIRECTORY`, and `quit`. Timing begins when streaming,
-and stdin EOF does not prematurely end a trial. The earlier resolution
-decision and its measurement limits are in the
-[resolution benchmark](resolution-benchmark.md).
+## Video diagnostics
 
-See the [engineering notes](engineering-notes.md) for earlier hardware results
-and the capture, encoder, and ADB behavior that motivated this design.
-
-The [sharpness results](sharpness-results.md) document the native Wi-Fi
-comparison, recovery testing, and the limits of the timing measurements.
-
-## Live color diagnostics
-
-While the desktop app is running, this action saves its latest encoded keyframe
-and a graph containing the negotiated pipeline caps. It does not reconnect the
-tablet. Use a directory that does not already exist:
+Save the latest encoded keyframe and negotiated pipeline graph without
+reconnecting. Choose a directory that does not exist:
 
 ```bash
 gdbus call --session \
@@ -176,68 +194,7 @@ gdbus call --session \
 ffprobe -v error -show_streams /tmp/extraspace-video-sample/frame.h264
 ```
 
-The snapshot contains desktop pixels. The directory is private to your account,
-and files are only written when the action is requested. The saved frame is the
-latest keyframe, which may precede the request if the desktop has been idle.
-
-## Native Wi-Fi and saved trust
-
-The desktop app listens on TCP port 47471 (or an available port if occupied)
-while open, and advertises `_extraspace._tcp.local.` through DNS-SD. Android's
-NSD finds it; the last successful endpoint is also tried when discovery fails.
-The tablet opens three TLS 1.3 connections, preserving separate control, video,
-and camera channels. The codec and framing stay the same as USB.
-
-Pairing is explicitly enabled in the desktop GUI for five minutes. A fresh,
-one-use 100-bit code is shown as a QR and as five groups of four characters.
-The QR also includes the certificate fingerprint and current endpoints. Manual
-entry discovers candidate laptops but does not trust their advertisements.
-The pairing exchange uses HMAC-SHA256, with separate client/server domains,
-over the server certificate fingerprint and fresh nonces from both endpoints.
-Android verifies the server proof before releasing a newly generated 256-bit
-credential; the host requires the client proof before saving its hash. The code
-is never sent over the network. Codes are deliberately longer than six digits
-to resist offline guessing without requiring a password protocol.
-
-Subsequent channels require the saved credential inside TLS; Android requires
-the exact saved certificate. Credentials and video are never sent to a server
-with an unverified identity. Android encrypts the credential with an app-specific
-AES-GCM key in Android Keystore. The host saves its certificate, private key,
-and approved credential hashes in `~/.config/extraspace/wireless.json` (0600,
-within a 0700 directory), respecting `XDG_CONFIG_HOME`. App updates retain trust;
-forgetting a device removes trust and closes its active session. No ADB service
-is involved in native Wi-Fi, and no service stays running after Extraspace exits.
-
-Transport tests exercise real TLS, rejected unknown credentials, persistence,
-three-channel assembly, and rejection after revocation. On the SM-X510, live
-checks covered GUI pairing, retaining trust across an APK upgrade, two desktop
-close/reopen cycles without restarting the tablet process, reopening the tablet,
-and reopening both apps with the desktop first. Each reconnected without a
-Connect press or repeated pairing. Network changes still need separate testing.
-
-USB listener teardown explicitly shuts down blocked accepts before closing
-their file descriptors. Binding happens off the main thread with a brief retry
-window, and each connection reports a disconnect only once. Session-generation
-guards discard stale callbacks so simultaneous channel closures cannot tear
-down a new connection. The desktop detects a lost control channel and returns
-to its waiting screen while the Android client retries automatically.
-
-Android connection resources follow the visible activity lifecycle. `onStart`
-creates a fresh discovery client and resumes the local listeners; `onStop`
-closes discovery and in-flight TLS attempts, releases the multicast lock, closes
-all channels, stops the decoder and camera, and removes the statistics timer.
-Saved credentials remain encrypted on disk. Generation guards reject callbacks
-from a previous visible session, including a connection completing after Home.
-The QR scanner is a separate activity: its result is queued until the display
-activity starts again. The display keeps the screen awake only while connected;
-waiting uses the normal Android timeout. USB's explicit ADB activity launch is
-independent of these resources and does not require a resident app listener.
-
-Live foreground/background checks on the SM-X510 covered two Home/return
-cycles in the same process: Home left no `xs-*` worker threads, released the
-`extraspace-discovery` multicast lock and closed the three TLS channels.
-Opening the desktop app over native Wi-Fi while the tablet app remained hidden
-did not wake it. Returning to the tablet app restored all three channels without
-pairing again. Touch and health-report writes use a bounded control-output
-worker, rather than performing TLS writes on Android's main thread; that worker
-is also stopped when the activity is hidden.
+The private directory contains desktop pixels. Files are written only on
+request. The latest keyframe may predate the request if the desktop is idle.
+Additional recording and stall diagnostics are documented with the
+[sharpness benchmark](benchmarks/sharpness.md#reproduction).

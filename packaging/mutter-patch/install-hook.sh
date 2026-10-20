@@ -13,7 +13,7 @@ version=$(pacman -Q mutter | awk '{print $2}')
 marker="${XDG_DATA_HOME:-$HOME/.local/share}/extraspace/patched-mutter"
 
 # Refuse to vouch for a mutter this directory did not build, otherwise the
-# marker would tell ExtraSpace that a stock package is safe to poke.
+# marker would incorrectly allow native scaling on an unpatched package.
 built=$(. ./PKGBUILD; echo "$pkgver-$pkgrel")
 if [ "$version" != "$built" ]; then
   echo "installed mutter is $version but this tree builds $built; run build-and-install.sh first" >&2

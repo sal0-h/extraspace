@@ -1,72 +1,61 @@
-# Mutter crash patch
+# Mutter virtual-monitor patches
 
-ExtraSpace's sharp display path asks mutter for a virtual monitor at the
-tablet's full panel resolution, passing the UI scale as the mode's
-`preferred-scale`. On stock mutter 50.4, 50.5, and 51.0 that logs you out.
+Extraspace's Sharper mode requests a near-native virtual monitor with a GNOME
+logical scale. The supplied Arch package targets Mutter 51.0-2 and GNOME Shell
+51. It includes guards for crashes reproduced on unpatched Mutter 50.4, 50.5,
+and 51.0. This is an Arch-specific build; it does not configure other
+packaging systems.
 
-## What goes wrong
+## Patches
 
-Passing `modes` to `RecordVirtual` makes mutter reload the monitor
-configuration. When the reload cannot apply a layout containing the new
-monitor, the CRTC is left without a configuration — and two places then
-dereference it anyway:
+`0001-virtual-monitor-guard-unconfigured-crtc.patch` handles a virtual CRTC
+without an assigned configuration. It guards the mode accessor and its callers,
+using the requested mode for initial stream specifications and skipping the
+current-mode comparison when none exists.
 
-- `meta_virtual_monitor_get_crtc_mode()` reads `crtc_config->mode` without
-  checking that a configuration exists.
-- `meta_stream_source_virtual_get_specs()` uses the mode it returns,
-  and `ensure_virtual_monitor()` compares against it.
+`0002-virtual-monitor-skip-null-stage-view.patch` guards cursor update paths
+while the virtual monitor has no renderer view. Without these checks, creating
+a virtual monitor can crash GNOME Shell and end the Wayland session.
 
-Either one takes gnome-shell down with a SIGSEGV, which on Wayland means the
-session ends and every open application dies with it.
+The package keeps `libmutter-51.so`, so the matching GNOME Shell does not need
+rebuilding. The [upstream report](UPSTREAM-REPORT.md) records the original CRTC
+crash. `upstream-main.patch` and `upstream-main-null-view.patch` contain the
+corresponding ports to the upstream revision used during that work.
 
-Guarding the CRTC accessor lets `RecordVirtual` get past init when the new
-monitor still has no renderer view. Cursor metadata then calls
-`clutter_stage_view_schedule_update()` with NULL and gnome-shell dies the
-same way. `0002-virtual-monitor-skip-null-stage-view.patch` returns from those
-callers until a view exists.
+## Build and install
 
-`0001-virtual-monitor-guard-unconfigured-crtc.patch` adds the missing checks and
-falls back to the mode that was requested, which is what the CRTC ends up using
-anyway. It touches no ABI: the soname stays `libmutter-51.so`, matching
-gnome-shell 51, so gnome-shell does not need rebuilding.
+From the repository root:
 
-This is reported upstream as [mutter#5007][], and `UPSTREAM-REPORT.md` is the
-write-up that was filed. `upstream-main.patch` is the CRTC fix ported to mutter
-`main`; `upstream-main-null-view.patch` is the stage-view follow-up. If upstream
-takes both, none of this directory is needed any more.
-
-[mutter#5007]: https://gitlab.gnome.org/GNOME/mutter/-/issues/5007
-
-## Using it
-
-```console
-./build-and-install.sh   # builds and installs, then records the version
+```bash
+./packaging/mutter-patch/build-and-install.sh
 ```
 
-Then log out and back in — a running compositor keeps the library it started
-with. `PKGBUILD` is Arch's `mutter` recipe with `pkgrel` bumped and the patches
-added to `source`, so it tracks whatever version that recipe is based on.
-The current target is 51.0-2 (stock extra is 51.0-1).
+The script builds with `makepkg`, installs with `sudo pacman -U`, records the
+patched package version, and installs a pacman warning hook. Log out and back
+in afterward so GNOME Shell loads the new library.
 
-To go back to the stock package:
+Open Extraspace normally and select **Image quality > Sharper**. No environment
+flag is required. The compatibility check must pass before the app uses it.
 
-```console
-./rollback.sh
+## Upgrades
+
+A system upgrade can replace the patched library. The pacman hook compares the
+installed package version with the marker at
+`$XDG_DATA_HOME/extraspace/patched-mutter` (default
+`~/.local/share/extraspace/patched-mutter`) and warns if they differ.
+
+Extraspace's `scaled_modes_supported()` checks that marker against the local
+pacman database and checks for a replaced library still mapped by GNOME Shell.
+If the check fails, the app uses Standard. After an upgrade, update the package
+recipe and patches for the new Mutter version, rebuild, then log out/in and
+restart Extraspace. Holding Mutter back can conflict with GNOME Shell upgrades.
+
+## Rollback
+
+```bash
+./packaging/mutter-patch/rollback.sh
 ```
 
-## Surviving mutter upgrades
-
-A later `mutter` upgrade replaces the patched build with the stock one and the
-crash comes back, so two things watch for it:
-
-- `install-hook.sh` records the patched version under
-  `$XDG_DATA_HOME/extraspace/patched-mutter` and installs a pacman hook that
-  warns after any `mutter` transaction where the two disagree.
-- ExtraSpace checks the same marker itself (`scaled_modes_allowed()`) and
-  refuses the scaled path unless the installed version matches and the running
-  shell is not still using a deleted `libmutter`. The result is a softer-looking
-  tablet rather than a logout.
-
-Rerun `build-and-install.sh` after an upgrade to get the sharp display back.
-Pinning `mutter` with `IgnorePkg` is a worse trade: it is version-locked against
-gnome-shell, so holding it back blocks GNOME upgrades entirely.
+This removes the marker and reinstalls stock Mutter, preferring a cached package
+under `~/build/mutter-rollback` if present. Log out/in and restart Extraspace
+afterward. The app will use Standard until a matching patched build is restored.

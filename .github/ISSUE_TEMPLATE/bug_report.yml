@@ -5,20 +5,22 @@ body:
   - type: markdown
     attributes:
       value: |
-        Include your GNOME version, distribution, tablet model, and Android
-        version. On Fedora, `./scripts/setup.sh --check` collects host setup
-        information without installing anything.
+        Include your desktop and tablet versions, connection type, and image
+        quality setting. On Fedora, `./scripts/setup.sh --check` reports host
+        dependencies without changing them.
 
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: GNOME version, distribution, kernel, and encoder. On Fedora, paste `./scripts/setup.sh --check`.
+      description: GNOME version, distribution, kernel, encoder, and display settings.
       render: shell
       placeholder: |
         GNOME version:
         Distribution and kernel:
         Encoder:
+        Connection (USB or native Wi-Fi):
+        Mode, scale, and image quality:
     validations:
       required: true
 
@@ -35,7 +37,7 @@ body:
     id: what-happened
     attributes:
       label: What happened
-      description: What you did, what you expected, what you got instead.
+      description: Steps to reproduce, expected behavior, and actual behavior.
     validations:
       required: true
 
@@ -64,5 +66,5 @@ body:
     attributes:
       label: Before filing
       options:
-        - label: "`adb devices` shows my tablet as `device`, not `unauthorized`"
-        - label: I tried a different USB cable (a surprising number are charge-only)
+        - label: "For USB: `adb devices` shows the tablet as `device`, and I tried a data cable."
+        - label: "For Wi-Fi: both apps are open, and I checked pairing and network isolation."

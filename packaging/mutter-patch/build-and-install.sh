@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds mutter 51.0-2 (51.0 plus the ExtraSpace virtual-monitor crash guards)
+# Builds mutter 51.0-2 (51.0 plus the Extraspace virtual-monitor crash guards)
 # and installs it.
 #
 # Needs sudo twice: once for makepkg to pull in build dependencies, once for
@@ -29,13 +29,12 @@ Done. Log out and back in, then:
 
     pacman -Q mutter          # expect: mutter $version
 
-To get the sharp, panel-resolution display, run ExtraSpace with:
+Open Extraspace normally and choose Image quality > Sharper in Settings.
+No environment flag is needed.
 
-    XS_MUTTER_MODES=1 extraspace
-
-A later mutter upgrade will print a warning and ExtraSpace will fall back to the
-safe sizing on its own, so that variable is harmless to leave set. Rerun this
-script to patch the new version.
+A later Mutter upgrade can replace the patched library. Extraspace will use
+Standard when its compatibility check fails. Update this package recipe and
+patches for the new version, rebuild, then log out and back in.
 
 To go back to the stock package at any time:
 

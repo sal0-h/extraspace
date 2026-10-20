@@ -1,20 +1,12 @@
-# Resolution decision on Salman's setup
+# USB resolution comparison
 
-Measured October 14, 2026. Keep the current 1536 × 960 stream at 1.5× as the
-everyday default. Native 2304 × 1440 at 1.5× makes small text clearer, but adds
-about 4–5 ms to the host video pipeline and substantially slows the CPU-drawn
-workload. It is a useful option for reading; it is not a consistent improvement
-for a desktop where responsiveness matters.
+Measured October 14, 2026, before the native Wi-Fi sharpness work. At the time,
+Standard at 1536 × 960 remained the default because the CPU/Cairo workload slowed
+at native resolution. The later [Wi-Fi benchmark](../benchmarks/sharpness.md)
+led to Sharper becoming preferred on compatible compositors and added recovery
+fixes. This report preserves the earlier measurements.
 
-The [October 19 sharpness research](sharpness-research.md) records follow-up
-opportunities to reduce this cost. The GPU scrolling result below already
-reached approximately 60 FPS at native resolution; the earlier default decision
-does not establish a universal native-resolution limit.
-
-The later [native Wi-Fi work](sharpness-results.md) adds a Sharper setting and
-records both its measured performance and the recovery fixes required to use it.
-
-Both modes provide a 1536 × 960 desktop workspace. The current mode enlarges its
+Both modes provide a 1536 × 960 desktop workspace. Standard enlarges its
 video on the tablet; native mode uses GNOME fractional scaling and sends the
 panel's full pixel resolution.
 
@@ -73,7 +65,7 @@ small text. These are synthetic workloads on one machine, not measurements of
 every application or of wireless performance. Background desktop activity and
 the short runs introduce some variation.
 
-## Measurement fixes
+## Tooling
 
 The old FPS counter counted incoming health reports and therefore tended toward
 2 fps even while video was smooth. It now divides the change in the tablet's
@@ -85,7 +77,7 @@ reduced framebuffer a second time when describing the desktop workspace, and
 calls the ping measurement a connection round trip.
 
 `cargo run --release -p xs-core --example resolution_bench` runs a real tablet
-session and emits JSON measurements. Close the desktop app before running it;
+session and emits JSON measurements using the current tooling. Close the desktop app before running it;
 `-- --resolution native --transport wifi` selects native scaling and saved-pairing
 Wi-Fi when the compositor check passes. Use `--transport usb --serial SERIAL`
 for an explicit USB trial. The benchmark disables camera forwarding and leaves
