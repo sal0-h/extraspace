@@ -99,3 +99,6 @@ jobs:
             packaging/mutter-patch/extraspace-mutter-patch-check; do
             bash -n "$script"
           done
+
+      - name: Mutter installer guards
+        run: python3 scripts/test-mutter-packaging.py

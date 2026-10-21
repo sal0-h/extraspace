@@ -1,7 +1,7 @@
 # Mutter virtual-monitor patches
 
 Extraspace's Sharper mode requests a near-native virtual monitor with a GNOME
-logical scale. The supplied Arch package targets Mutter 51.0-2 and GNOME Shell
+logical scale. The supplied Arch package targets Mutter 51.1-2 and GNOME Shell
 51. It includes guards for crashes reproduced on unpatched Mutter 50.4, 50.5,
 and 51.0. This is an Arch-specific build; it does not configure other
 packaging systems.
@@ -36,6 +36,10 @@ in afterward so GNOME Shell loads the new library.
 
 Open Extraspace normally and select **Image quality > Sharper**. No environment
 flag is required. The compatibility check must pass before the app uses it.
+
+To build without installing, use `--build-only`. Once the package is ready,
+`--install-only` installs it without recompiling. The installer verifies the
+package version and refuses to downgrade a newer installed Mutter.
 
 ## Upgrades
 

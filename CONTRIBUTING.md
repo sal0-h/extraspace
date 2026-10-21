@@ -36,6 +36,7 @@ for script in scripts/*.sh packaging/mutter-patch/*.sh \
   packaging/mutter-patch/extraspace-mutter-patch-check; do
   bash -n "$script"
 done
+python3 scripts/test-mutter-packaging.py
 ```
 
 After building the release host, test windowless controls on a private session
